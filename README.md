@@ -1,38 +1,37 @@
-# ViscoSim — Simulatore CFD di Viscosità e Reologia
+# ViscoSim — CFD Viscosity and Rheology Simulator
 
-Applicazione web client-side per la simulazione fluidodinamica 2D in vasca cilindrica agitata e l'analisi reologica di fluidi industriali nell'intervallo `0 – 500.000 mPa·s`.
+A client-side web application for 2D computational fluid dynamics (CFD) simulation in a cylindrical stirred tank and rheological analysis of industrial fluids within the `0 – 500,000 mPa·s` viscosity range.
 
-## Modello Numerico e Rendering
+## Numerical Model and Rendering
 
-- **Solutore fluido**: griglia sfalsata MAC `96×96` con condizioni al contorno *no-slip* sulla parete circolare e distanze sub-cella esatte per i gradienti di bordo.
-- **Integratore viscoso & pressione**: *Galerkin Multigrid* (`5` livelli) + *PCG* per la diffusione viscosa implicita e schema *Rotational Incremental Pressure-Correction* a 2 passaggi per stabilità in regime *Stokes/Creeping* e basso Reynolds.
-- **Reologia**: modelli Newtoniano, *Power-Law* e *Herschel-Bulkley* regolarizzato (Papanastasiou) con calcolo in tempo reale di taglio $\dot{\gamma}$, sforzo $\tau$, vorticità $\omega$, numero di Reynolds $Re$ ed indice di omogeneità di Danckwerts $M(t)$.
-- **Visualizzazione**: pipeline *WebGL1* con filtraggio bicubico *Catmull-Rom* su texture floating-normalized e fallback automatico su *Canvas 2D*.
+- **Fluid Solver**: `96×96` staggered MAC grid with *no-slip* boundary conditions along the circular wall and exact sub-cell distances for boundary gradient calculations.
+- **Viscous Integration & Pressure**: *Galerkin Multigrid* (`5` levels) combined with *PCG* for implicit viscous diffusion, and a two-step *Rotational Incremental Pressure-Correction* scheme for numerical stability under *Stokes/Creeping Flow* and low-Reynolds-number conditions.
+- **Rheology**: Newtonian, *Power-Law*, and Papanastasiou-regularized *Herschel-Bulkley* models, with real-time computation of shear rate $\dot{\gamma}$, shear stress $\tau$, vorticity $\omega$, Reynolds number $Re$, and Danckwerts' homogeneity index $M(t)$.
+- **Visualization**: *WebGL1* rendering pipeline with *Catmull-Rom* bicubic filtering on normalized floating-point textures and automatic fallback to *Canvas 2D*.
 
-## Struttura del Progetto
+## Project Structure
 
 ```text
 src/
 ├── components/
-│   ├── FluidViewport.tsx   # Viewport interattivo WebGL + overlay vettori e sonda locale
-│   ├── InfoTooltip.tsx     # Tooltip contestuali accessibili
-│   ├── MixingChart.tsx     # Serie storica omogeneità M(t) ed energia cinetica Ek
-│   └── RheologyChart.tsx   # Curva di flusso log-log τ(γ̇) e μ(γ̇)
+│   ├── FluidViewport.tsx   # Interactive WebGL viewport with vector overlays and local probe
+│   ├── InfoTooltip.tsx     # Accessible contextual tooltips
+│   ├── MixingChart.tsx     # Time series of homogeneity M(t) and kinetic energy Ek
+│   └── RheologyChart.tsx   # Log-log flow curves τ(γ̇) and μ(γ̇)
 ├── constants/
-│   └── fluids.ts           # Preset industriali calibrati e funzioni reologiche
+│   └── fluids.ts           # Calibrated industrial fluid presets and rheological functions
 ├── simulation/
-│   └── cfdEngine.ts        # Motore CFD Galerkin MG-PCG e renderer WebGL/2D
+│   └── cfdEngine.ts        # Galerkin MG-PCG CFD engine and WebGL/2D renderer
 ├── types/
-│   └── rheology.ts         # Contratti TypeScript per configurazione, sonda e metriche
-└── App.tsx                 # Interfaccia di controllo, telemetria ed esportazione CSV
+│   └── rheology.ts         # TypeScript contracts for configuration, probe, and metrics
+└── App.tsx                 # Control interface, telemetry, and CSV export
 ```
 
-## Sviluppo e Build
+## Development and Build
 
 ```bash
 npm install
-npm run dev      # Avvia il server di sviluppo su http://localhost:3000
-npm run lint     # Verifica tipi TypeScript in modalità strict
-npm run build    # Genera il bundle statico di produzione in dist/
+npm run dev      # Starts the development server at http://localhost:3000
+npm run lint     # Performs TypeScript type checking in strict mode
+npm run build    # Generates the static production bundle in dist/
 ```
-
