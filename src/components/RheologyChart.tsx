@@ -1,5 +1,10 @@
 import React, { useMemo, useState } from 'react';
-import { computeApparentViscosityPaS, computeShearStressPa } from '../constants/fluids';
+import {
+  computeApparentViscosityPaS,
+  computeShearStressPa,
+  MIN_VISCOSITY_MPAS,
+  SHEAR_REGULARIZATION_S_INV,
+} from '../constants/fluids';
 import { FluidConfig } from '../types/rheology';
 import InfoTooltip from './InfoTooltip';
 
@@ -27,15 +32,19 @@ const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRat
 
   const curveGeometry = useMemo(() => {
     const pts = SHEAR_SAMPLES.map((gamma) => {
-      const tau = computeShearStressPa(gamma, config);
-      const muMpas = computeApparentViscosityPaS(gamma, config) * 1000;
-      return { gamma, tau: Math.max(1e-4, tau), muMpas: Math.max(0.01, muMpas) };
+      const tau = computeShearStressPa(gamma, config, SHEAR_REGULARIZATION_S_INV);
+      const muMpas = computeApparentViscosityPaS(gamma, config, SHEAR_REGULARIZATION_S_INV) * 1000;
+      return {
+        gamma,
+        tau: Math.max(1e-6, tau),
+        muMpas: Math.max(MIN_VISCOSITY_MPAS * 0.1, muMpas),
+      };
     });
 
     const minLogTau = Math.floor(Math.min(...pts.map((p) => Math.log10(p.tau)), -2));
     const maxLogTau = Math.ceil(Math.max(...pts.map((p) => Math.log10(p.tau)), 3));
 
-    const minLogMu = Math.floor(Math.min(...pts.map((p) => Math.log10(p.muMpas)), -1));
+    const minLogMu = Math.floor(Math.min(...pts.map((p) => Math.log10(p.muMpas)), -2));
     const maxLogMu = Math.ceil(Math.max(...pts.map((p) => Math.log10(p.muMpas)), 5));
 
     const mapX = (gamma: number) => {
@@ -79,8 +88,12 @@ const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRat
 
   const operatingPoint = useMemo(() => {
     const clampedOpGamma = Math.max(0.1, Math.min(1000, operatingShearRate || 0.1));
-    const opTau = Math.max(1e-4, computeShearStressPa(clampedOpGamma, config));
-    const opMu = Math.max(0.01, computeApparentViscosityPaS(clampedOpGamma, config) * 1000);
+    const opTau = Math.max(
+      1e-6,
+      computeShearStressPa(clampedOpGamma, config, SHEAR_REGULARIZATION_S_INV)
+    );
+    const opMu =
+      computeApparentViscosityPaS(clampedOpGamma, config, SHEAR_REGULARIZATION_S_INV) * 1000;
     return {
       clampedOpGamma,
       opTau,
@@ -109,11 +122,11 @@ const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRat
             Curva di Flusso Reologica (Log-Log)
             <InfoTooltip
               title="Come leggere la Curva di Flusso"
-              description="Mostra come reagisce il fluido all’aumentare dell’agitazione (γ̇). La linea ciano indica la forza necessaria (τ), quella ambra tratteggiata la viscosità effettiva (μ). Il pallino ciano mostra lo stato attuale nella vasca."
+              description="Mostra la legge costitutiva fisica regolarizzata usata dal solutore (con γ̇_reg = 10⁻³ s⁻¹ e Papanastasiou m). La linea ciano indica τ (Pa), quella ambra tratteggiata la viscosità apparente μ (mPa·s)."
             />
           </h3>
           <p className="text-xs text-slate-400">
-            Sforzo τ (Pa) e viscosità apparente μ (mPa·s) al variare del taglio γ̇
+            Sforzo τ (Pa) e viscosità fisica apparente μ (mPa·s) al variare di γ̇
           </p>
         </div>
         <div className="flex items-center gap-4 text-[11px] font-mono">
@@ -230,13 +243,25 @@ const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRat
           <>
             <span>Cursore γ̇: {activePoint.gamma.toFixed(2)} s⁻¹</span>
             <span>τ: {activePoint.tau.toFixed(3)} Pa</span>
-            <span>μ: {activePoint.muMpas >= 100 ? Math.round(activePoint.muMpas).toLocaleString('it-IT') : activePoint.muMpas.toFixed(2)} mPa·s</span>
+            <span>
+              μ:{' '}
+              {activePoint.muMpas >= 100
+                ? Math.round(activePoint.muMpas).toLocaleString('it-IT')
+                : activePoint.muMpas.toFixed(3)}{' '}
+              mPa·s
+            </span>
           </>
         ) : (
           <>
             <span>Punto vasca γ̇̄: {curveData.clampedOpGamma.toFixed(2)} s⁻¹</span>
             <span>τ̄: {curveData.opTau.toFixed(3)} Pa</span>
-            <span>μ_eff: {curveData.opMu >= 100 ? Math.round(curveData.opMu).toLocaleString('it-IT') : curveData.opMu.toFixed(2)} mPa·s</span>
+            <span>
+              μ_eff:{' '}
+              {curveData.opMu >= 100
+                ? Math.round(curveData.opMu).toLocaleString('it-IT')
+                : curveData.opMu.toFixed(3)}{' '}
+              mPa·s
+            </span>
           </>
         )}
       </div>
