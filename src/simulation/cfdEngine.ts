@@ -11,9 +11,14 @@ import {
 } from '../types/rheology';
 
 export const GRID_N = 96;
-const ROW_SIZE = GRID_N + 2;
-const GRID_SIZE = ROW_SIZE * ROW_SIZE;
 const MG_LEVELS = 5;
+const PRESSURE_MAX_ITERATIONS = 16;
+const PRESSURE_RESIDUAL_TOLERANCE_SQ = 1e-5;
+// Use matching forward and reverse sweeps for the PCG preconditioner.
+const PCG_SMOOTHING_SWEEPS = 1;
+const TR_BDF2_GAMMA = 2 - Math.SQRT2;
+const ROD_PENALTY_RATE = 1080;
+const DISK_VISCOUS_MODE_SQUARED = 14.681970642;
 
 const IS_LITTLE_ENDIAN = (() => {
   const buf = new ArrayBuffer(4);
@@ -167,14 +172,18 @@ const FRAGMENT_SHADER_SRC = `
       float wU = sampleBicubicRG(u_fieldTex, flippedUv + vec2(0.0, eps)).r;
       float wD = sampleBicubicRG(u_fieldTex, flippedUv - vec2(0.0, eps)).r;
 
-      float relief = (wL - wR + wU - wD) * 0.65;
-      float rimShade = 1.0 - 0.22 * smoothstep(0.34, 0.45, dist);
+      vec2 fromCenter = (flippedUv - 0.5) / 0.45;
+      float facing = sqrt(max(0.0, 1.0 - dot(fromCenter, fromCenter)));
+      float directional = clamp(0.82 - dot(fromCenter, vec2(0.21, 0.35)), 0.26, 1.1);
+      float rimShade = directional * (0.58 + 0.42 * facing);
+      float relief = (wL - wR + wU - wD) * 1.1;
       float groove = clamp(val.r, 0.0, 1.0);
       float sheen = clamp(val.g, 0.0, 1.0);
 
-      vec3 baseFluid = u_fluidColor * rimShade;
-      vec3 grooved = mix(baseFluid, baseFluid * 0.72, groove * 0.55);
-      col = grooved + vec3(relief * 0.28 + sheen * 0.10);
+      vec3 deepColor = mix(u_fluidColor, vec3(0.06, 0.09, 0.33), 0.6);
+      vec3 baseFluid = mix(deepColor, u_fluidColor, rimShade);
+      vec3 grooved = mix(baseFluid, baseFluid * 0.55 + vec3(0.03, 0.02, 0.1), groove * 0.82);
+      col = grooved + vec3(0.57, 0.83, 1.0) * (relief * 0.55 + sheen * 0.2);
     } else {
       float t = clamp(val.r, 0.002, 0.998);
       col = texture2D(u_lutTex, vec2(t, 0.5)).rgb;
@@ -230,10 +239,10 @@ function parseHexColor(hex: string): [number, number, number] {
   return [parseInt(match[1], 16), parseInt(match[2], 16), parseInt(match[3], 16)];
 }
 
-function createGalerkinHierarchy(): GalerkinLevel[] {
+function createGalerkinHierarchy(gridSize: number): GalerkinLevel[] {
   const levels: GalerkinLevel[] = [];
   for (let l = 0; l < MG_LEVELS; l++) {
-    const n = GRID_N >> l;
+    const n = gridSize >> l;
     const rs = n + 2;
     const size = rs * rs;
     levels.push({
@@ -417,60 +426,258 @@ function runGalerkinVCycle(
   smoothGalerkin(lvl, postSweeps, true);
 }
 
+
+interface ViscousBlock {
+  levels: GalerkinLevel[];
+  mask: Uint8Array;
+  x: Float64Array;
+  r: Float64Array;
+  direction: Float64Array;
+  product: Float64Array;
+}
+
+function createViscousBlock(n: number, mask: Uint8Array): ViscousBlock {
+  const buffer = () => new Float64Array(mask.length);
+  return {
+    levels: createGalerkinHierarchy(n),
+    mask,
+    x: buffer(),
+    r: buffer(),
+    direction: buffer(),
+    product: buffer(),
+  };
+}
+
+function addStressLink(
+  block: ViscousBlock, first: number, second: number, weight: number, horizontal: boolean,
+): void {
+  const level = block.levels[0];
+  if (block.mask[first] && block.mask[second]) {
+    const links = horizontal ? level.cE : level.cN;
+    links[first] += weight;
+  } else if (block.mask[first]) {
+    level.selfDiag[first] += weight;
+  } else if (block.mask[second]) {
+    level.selfDiag[second] += weight;
+  }
+}
+
+class ViscousStressSolver {
+  private u: ViscousBlock;
+  private v: ViscousBlock;
+  private corner: Float64Array;
+  private corners = 0;
+  private cornerIndices: Int32Array;
+
+  constructor(
+    private readonly n: number,
+    private readonly row: number,
+    private readonly cells: Uint8Array,
+    uMask: Uint8Array,
+    vMask: Uint8Array,
+  ) {
+    this.u = createViscousBlock(n, uMask);
+    this.v = createViscousBlock(n, vMask);
+    this.corner = new Float64Array(cells.length);
+    this.cornerIndices = new Int32Array(cells.length);
+  }
+
+  private assemble(mu: Float32Array, alpha: number, rodU: Float32Array, rodV: Float32Array): void {
+    const row = this.row;
+    for (const [block, rod] of [[this.u, rodU], [this.v, rodV]] as const) {
+      const level = block.levels[0];
+      level.active.set(block.mask);
+      level.cE.fill(0);
+      level.cN.fill(0);
+      for (let i = 0; i < this.cells.length; i++) level.selfDiag[i] = 1 + rod[i];
+    }
+    for (let i = 0; i < this.cells.length; i++) {
+      if (!this.cells[i]) continue;
+      const weight = 2 * alpha * mu[i];
+      addStressLink(this.u, i, i + 1, weight, true);
+      addStressLink(this.v, i, i + row, weight, false);
+    }
+
+    this.corners = 0;
+    for (let j = 1; j <= this.n + 1; j++) {
+      for (let k = 1; k <= this.n + 1; k++) {
+        const i = k + j * row;
+        const count = this.cells[i] + this.cells[i - 1] + this.cells[i - row] + this.cells[i - row - 1];
+        if (!count) continue;
+        const weight = alpha * (
+          this.cells[i] * mu[i] + this.cells[i - 1] * mu[i - 1] +
+          this.cells[i - row] * mu[i - row] + this.cells[i - row - 1] * mu[i - row - 1]
+        ) / count;
+        addStressLink(this.u, i - row, i, weight, false);
+        addStressLink(this.v, i - 1, i, weight, true);
+        this.corner[i] = weight;
+        this.cornerIndices[this.corners++] = i;
+      }
+    }
+
+    for (const block of [this.u, this.v]) {
+      const level = block.levels[0];
+      for (let i = 0; i < this.cells.length; i++) {
+        level.diag[i] = block.mask[i]
+          ? level.selfDiag[i] + level.cE[i - 1] + level.cE[i] + level.cN[i - row] + level.cN[i]
+          : 1;
+      }
+      coarsenGalerkinHierarchy(block.levels);
+    }
+  }
+
+  private apply(inputU: Float64Array, inputV: Float64Array): void {
+    const row = this.row;
+    for (const [block, input] of [[this.u, inputU], [this.v, inputV]] as const) {
+      const { diag, cE, cN } = block.levels[0];
+      for (let i = 0; i < this.cells.length; i++) {
+        block.product[i] = block.mask[i]
+          ? diag[i] * input[i] - cE[i - 1] * input[i - 1] - cE[i] * input[i + 1]
+            - cN[i - row] * input[i - row] - cN[i] * input[i + row]
+          : 0;
+      }
+    }
+    const u = this.u;
+    const v = this.v;
+    for (let k = 0; k < this.corners; k++) {
+      const i = this.cornerIndices[k];
+      const weight = this.corner[i];
+      const x = weight * (inputV[i] - inputV[i - 1]);
+      const y = weight * (inputU[i] - inputU[i - row]);
+      if (u.mask[i]) u.product[i] += x;
+      if (u.mask[i - row]) u.product[i - row] -= x;
+      if (v.mask[i]) v.product[i] += y;
+      if (v.mask[i - 1]) v.product[i - 1] -= y;
+    }
+  }
+
+  private precondition(): number {
+    let rz = 0;
+    for (const block of [this.u, this.v]) {
+      const head = block.levels[0];
+      head.rhs.set(block.r);
+      head.x.fill(0);
+      runGalerkinVCycle(block.levels, 0, 1, 1, 8);
+      for (let i = 0; i < this.cells.length; i++) rz += block.r[i] * head.x[i];
+    }
+    return rz;
+  }
+
+  solve(
+    u: Float32Array, v: Float32Array, p: Float32Array, mu: Float32Array,
+    rodU: Float32Array, rodV: Float32Array, tipX: number, tipY: number,
+    alpha: number, pressureScale: number, budget: number,
+  ): number {
+    this.assemble(mu, alpha, rodU, rodV);
+    this.u.x.set(u);
+    this.v.x.set(v);
+    this.apply(this.u.x, this.v.x);
+    let initialResidual = 0;
+    for (const [block, field, rod, tip, stride] of [
+      [this.u, u, rodU, tipX, 1], [this.v, v, rodV, tipY, this.row],
+    ] as const) {
+      for (let i = 0; i < this.cells.length; i++) {
+        const residual = block.mask[i]
+          ? field[i] + rod[i] * tip - pressureScale * (p[i] - p[i - stride]) - block.product[i]
+          : 0;
+        block.r[i] = residual;
+        initialResidual += residual ** 2;
+      }
+    }
+
+    const absoluteToleranceSq = 1e-16 * this.cells.length;
+    const toleranceSq = Math.max(absoluteToleranceSq, initialResidual * 1e-6);
+    let residual = initialResidual;
+    if (initialResidual > toleranceSq) {
+      let rz = this.precondition();
+      for (const block of [this.u, this.v]) block.direction.set(block.levels[0].x);
+      for (let iteration = 0; iteration < budget; iteration++) {
+        this.apply(this.u.direction, this.v.direction);
+        let pAp = 0;
+        for (const block of [this.u, this.v]) {
+          for (let i = 0; i < this.cells.length; i++) pAp += block.direction[i] * block.product[i];
+        }
+        if (!(pAp > 0 && rz > 0)) break;
+        const step = rz / pAp;
+        residual = 0;
+        for (const block of [this.u, this.v]) {
+          for (let i = 0; i < this.cells.length; i++) {
+            block.x[i] += step * block.direction[i];
+            block.r[i] -= step * block.product[i];
+            residual += block.r[i] ** 2;
+          }
+        }
+        if (residual <= toleranceSq) break;
+        const nextRz = this.precondition();
+        const beta = nextRz / rz;
+        for (const block of [this.u, this.v]) {
+          const z = block.levels[0].x;
+          for (let i = 0; i < this.cells.length; i++) block.direction[i] = z[i] + beta * block.direction[i];
+        }
+        rz = nextRz;
+      }
+    }
+    u.set(this.u.x);
+    v.set(this.v.x);
+    return residual > absoluteToleranceSq ? Math.sqrt(residual / initialResidual) : 0;
+  }
+}
+
 export class CFDEngine {
-  public readonly n = GRID_N;
-  public readonly rowSize = ROW_SIZE;
-  public readonly tankRadiusGrid = GRID_N * 0.45;
-  public readonly midGrid = (GRID_N + 1) * 0.5;
+  public readonly n: number;
+  public readonly rowSize: number;
+  public readonly tankRadiusGrid: number;
+  public readonly midGrid: number;
+  private readonly gridSize: number;
 
-  private u = new Float32Array(GRID_SIZE);
-  private v = new Float32Array(GRID_SIZE);
-  private uTmp = new Float32Array(GRID_SIZE);
-  private vTmp = new Float32Array(GRID_SIZE);
-  private uFwd = new Float32Array(GRID_SIZE);
-  private vFwd = new Float32Array(GRID_SIZE);
-  private uBwd = new Float32Array(GRID_SIZE);
-  private vBwd = new Float32Array(GRID_SIZE);
+  private u: Float32Array;
+  private v: Float32Array;
+  private uTmp: Float32Array;
+  private vTmp: Float32Array;
+  private uFwd: Float32Array;
+  private vFwd: Float32Array;
+  private uBwd: Float32Array;
+  private vBwd: Float32Array;
 
-  private p = new Float32Array(GRID_SIZE);
-  private dye = new Float32Array(GRID_SIZE);
-  private dyeTmp = new Float32Array(GRID_SIZE);
-  private dyeFwd = new Float32Array(GRID_SIZE);
-  private dyeBwd = new Float32Array(GRID_SIZE);
+  private p: Float32Array;
+  private dye: Float32Array;
+  private dyeTmp: Float32Array;
 
-  private wake = new Float32Array(GRID_SIZE);
-  private wakeTmp = new Float32Array(GRID_SIZE);
-  private wakeFwd = new Float32Array(GRID_SIZE);
-  private wakeBwd = new Float32Array(GRID_SIZE);
+  private wake: Float32Array;
+  private wakeTmp: Float32Array;
+  private wakeFwd: Float32Array;
+  private wakeBwd: Float32Array;
 
-  private shearRate = new Float32Array(GRID_SIZE);
-  private shearStress = new Float32Array(GRID_SIZE);
-  private vorticity = new Float32Array(GRID_SIZE);
-  private absVort = new Float32Array(GRID_SIZE);
-  private muApp = new Float32Array(GRID_SIZE);
-  private speedField = new Float32Array(GRID_SIZE);
-  private scalarA = new Float32Array(GRID_SIZE);
-  private scalarB = new Float32Array(GRID_SIZE);
+  private shearRate: Float32Array;
+  private shearStress: Float32Array;
+  private vorticity: Float32Array;
+  private absVort: Float32Array;
+  private muApp: Float32Array;
+  private speedField: Float32Array;
+  private scalarA: Float32Array;
+  private scalarB: Float32Array;
 
-  private pMask = new Uint8Array(GRID_SIZE);
-  private uMask = new Uint8Array(GRID_SIZE);
-  private vMask = new Uint8Array(GRID_SIZE);
-  private uWallFactor = new Float32Array(GRID_SIZE);
-  private vWallFactor = new Float32Array(GRID_SIZE);
-  private wallDeltaE = new Float32Array(GRID_SIZE);
-  private wallDeltaW = new Float32Array(GRID_SIZE);
-  private wallDeltaN = new Float32Array(GRID_SIZE);
-  private wallDeltaS = new Float32Array(GRID_SIZE);
-  private uRodWeight = new Float32Array(GRID_SIZE);
-  private vRodWeight = new Float32Array(GRID_SIZE);
+  private pMask: Uint8Array;
+  private uMask: Uint8Array;
+  private vMask: Uint8Array;
+  private uWallFactor: Float32Array;
+  private vWallFactor: Float32Array;
+  private wallDeltaE: Float32Array;
+  private wallDeltaW: Float32Array;
+  private wallDeltaN: Float32Array;
+  private wallDeltaS: Float32Array;
+  private uRodWeight: Float32Array;
+  private vRodWeight: Float32Array;
 
-  private cgX = new Float32Array(GRID_SIZE);
-  private cgR = new Float32Array(GRID_SIZE);
-  private cgP = new Float32Array(GRID_SIZE);
-  private cgAp = new Float32Array(GRID_SIZE);
+  private cgX: Float32Array;
+  private cgR: Float32Array;
+  private cgP: Float32Array;
+  private cgAp: Float32Array;
 
-  private diffLevels: GalerkinLevel[] = createGalerkinHierarchy();
-  private pressLevels: GalerkinLevel[] = createGalerkinHierarchy();
+  private diffLevels: GalerkinLevel[];
+  private pressLevels: GalerkinLevel[];
+  private stressSolver: ViscousStressSolver | undefined;
+  private stressResidual = 0;
 
   private rimTargetIndices: Int32Array = new Int32Array(0);
   private rimSourceIndices: Int32Array = new Int32Array(0);
@@ -493,7 +700,7 @@ export class CFDEngine {
     tipVy: 0,
   };
 
-  private glFieldBytes = new Uint8Array(GRID_N * GRID_N * 4);
+  private glFieldBytes: Uint8Array;
   private glRenderer: WebGLRenderer | null = null;
 
   private fallbackCanvas: HTMLCanvasElement | null = null;
@@ -501,7 +708,57 @@ export class CFDEngine {
   private fallbackImageData: ImageData | null = null;
   private fallbackBuf32: Uint32Array | null = null;
 
-  constructor() {
+  constructor(n = GRID_N) {
+    const coarseFactor = 2 ** (MG_LEVELS - 1);
+    if (!Number.isInteger(n) || n < 2 * coarseFactor || n % coarseFactor !== 0) {
+      throw new RangeError('Grid size must be a multiple of ' + coarseFactor + ' and at least ' + (2 * coarseFactor));
+    }
+    this.n = n;
+    this.rowSize = n + 2;
+    this.gridSize = this.rowSize ** 2;
+    this.tankRadiusGrid = n * 0.45;
+    this.midGrid = (n + 1) * 0.5;
+    this.u = new Float32Array(this.gridSize);
+    this.v = new Float32Array(this.gridSize);
+    this.uTmp = new Float32Array(this.gridSize);
+    this.vTmp = new Float32Array(this.gridSize);
+    this.uFwd = new Float32Array(this.gridSize);
+    this.vFwd = new Float32Array(this.gridSize);
+    this.uBwd = new Float32Array(this.gridSize);
+    this.vBwd = new Float32Array(this.gridSize);
+    this.p = new Float32Array(this.gridSize);
+    this.dye = new Float32Array(this.gridSize);
+    this.dyeTmp = new Float32Array(this.gridSize);
+    this.wake = new Float32Array(this.gridSize);
+    this.wakeTmp = new Float32Array(this.gridSize);
+    this.wakeFwd = new Float32Array(this.gridSize);
+    this.wakeBwd = new Float32Array(this.gridSize);
+    this.shearRate = new Float32Array(this.gridSize);
+    this.shearStress = new Float32Array(this.gridSize);
+    this.vorticity = new Float32Array(this.gridSize);
+    this.absVort = new Float32Array(this.gridSize);
+    this.muApp = new Float32Array(this.gridSize);
+    this.speedField = new Float32Array(this.gridSize);
+    this.scalarA = new Float32Array(this.gridSize);
+    this.scalarB = new Float32Array(this.gridSize);
+    this.pMask = new Uint8Array(this.gridSize);
+    this.uMask = new Uint8Array(this.gridSize);
+    this.vMask = new Uint8Array(this.gridSize);
+    this.uWallFactor = new Float32Array(this.gridSize);
+    this.vWallFactor = new Float32Array(this.gridSize);
+    this.wallDeltaE = new Float32Array(this.gridSize);
+    this.wallDeltaW = new Float32Array(this.gridSize);
+    this.wallDeltaN = new Float32Array(this.gridSize);
+    this.wallDeltaS = new Float32Array(this.gridSize);
+    this.uRodWeight = new Float32Array(this.gridSize);
+    this.vRodWeight = new Float32Array(this.gridSize);
+    this.cgX = new Float32Array(this.gridSize);
+    this.cgR = new Float32Array(this.gridSize);
+    this.cgP = new Float32Array(this.gridSize);
+    this.cgAp = new Float32Array(this.gridSize);
+    this.diffLevels = createGalerkinHierarchy(this.n);
+    this.pressLevels = createGalerkinHierarchy(this.n);
+    this.glFieldBytes = new Uint8Array(this.n * this.n * 4);
     this.buildMasks();
     this.reset(1.0);
   }
@@ -586,8 +843,8 @@ export class CFDEngine {
       gl.TEXTURE_2D,
       0,
       gl.RGBA,
-      GRID_N,
-      GRID_N,
+      this.n,
+      this.n,
       0,
       gl.RGBA,
       gl.UNSIGNED_BYTE,
@@ -621,7 +878,7 @@ export class CFDEngine {
       return false;
     }
 
-    gl.uniform1f(gl.getUniformLocation(program, 'u_texSize'), GRID_N);
+    gl.uniform1f(gl.getUniformLocation(program, 'u_texSize'), this.n);
     gl.uniform1i(gl.getUniformLocation(program, 'u_fieldTex'), 0);
 
     this.glRenderer = {
@@ -673,11 +930,11 @@ export class CFDEngine {
   private ensureFallback2D(): void {
     if (this.fallbackCanvas) return;
     const c = document.createElement('canvas');
-    c.width = GRID_N;
-    c.height = GRID_N;
+    c.width = this.n;
+    c.height = this.n;
     const ctx = c.getContext('2d', { alpha: false });
     if (!ctx) return;
-    const img = ctx.createImageData(GRID_N, GRID_N);
+    const img = ctx.createImageData(this.n, this.n);
     this.fallbackCanvas = c;
     this.fallbackCtx = ctx;
     this.fallbackImageData = img;
@@ -688,11 +945,11 @@ export class CFDEngine {
     const rSq = this.tankRadiusGrid * this.tankRadiusGrid;
     let count = 0;
 
-    for (let j = 1; j <= GRID_N; j++) {
+    for (let j = 1; j <= this.n; j++) {
       const dj = j - this.midGrid;
-      for (let i = 1; i <= GRID_N; i++) {
+      for (let i = 1; i <= this.n; i++) {
         const di = i - this.midGrid;
-        const idx = i + j * ROW_SIZE;
+        const idx = i + j * this.rowSize;
         if (di * di + dj * dj < rSq) {
           this.pMask[idx] = 1;
           count++;
@@ -703,19 +960,19 @@ export class CFDEngine {
 
     const rimTargets: number[] = [];
     const rimSources: number[] = [];
-    for (let j = 1; j <= GRID_N; j++) {
-      for (let i = 1; i <= GRID_N; i++) {
-        const idx = i + j * ROW_SIZE;
+    for (let j = 1; j <= this.n; j++) {
+      for (let i = 1; i <= this.n; i++) {
+        const idx = i + j * this.rowSize;
         if (this.pMask[idx]) continue;
         let src = 0;
         if (this.pMask[idx - 1]) src = idx - 1;
         else if (this.pMask[idx + 1]) src = idx + 1;
-        else if (this.pMask[idx - ROW_SIZE]) src = idx - ROW_SIZE;
-        else if (this.pMask[idx + ROW_SIZE]) src = idx + ROW_SIZE;
-        else if (this.pMask[idx - 1 - ROW_SIZE]) src = idx - 1 - ROW_SIZE;
-        else if (this.pMask[idx + 1 - ROW_SIZE]) src = idx + 1 - ROW_SIZE;
-        else if (this.pMask[idx - 1 + ROW_SIZE]) src = idx - 1 + ROW_SIZE;
-        else if (this.pMask[idx + 1 + ROW_SIZE]) src = idx + 1 + ROW_SIZE;
+        else if (this.pMask[idx - this.rowSize]) src = idx - this.rowSize;
+        else if (this.pMask[idx + this.rowSize]) src = idx + this.rowSize;
+        else if (this.pMask[idx - 1 - this.rowSize]) src = idx - 1 - this.rowSize;
+        else if (this.pMask[idx + 1 - this.rowSize]) src = idx + 1 - this.rowSize;
+        else if (this.pMask[idx - 1 + this.rowSize]) src = idx - 1 + this.rowSize;
+        else if (this.pMask[idx + 1 + this.rowSize]) src = idx + 1 + this.rowSize;
 
         if (src > 0) {
           rimTargets.push(idx);
@@ -726,13 +983,13 @@ export class CFDEngine {
     this.rimTargetIndices = new Int32Array(rimTargets);
     this.rimSourceIndices = new Int32Array(rimSources);
 
-    for (let j = 1; j <= GRID_N; j++) {
-      for (let i = 1; i <= GRID_N; i++) {
-        const idx = i + j * ROW_SIZE;
+    for (let j = 1; j <= this.n; j++) {
+      for (let i = 1; i <= this.n; i++) {
+        const idx = i + j * this.rowSize;
         if (this.pMask[idx] && this.pMask[idx - 1]) {
           this.uMask[idx] = 1;
         }
-        if (this.pMask[idx] && this.pMask[idx - ROW_SIZE]) {
+        if (this.pMask[idx] && this.pMask[idx - this.rowSize]) {
           this.vMask[idx] = 1;
         }
       }
@@ -758,11 +1015,11 @@ export class CFDEngine {
     this.wallDeltaN.fill(1);
     this.wallDeltaS.fill(1);
 
-    for (let j = 1; j <= GRID_N; j++) {
+    for (let j = 1; j <= this.n; j++) {
       const dj = j - mid;
-      for (let i = 1; i <= GRID_N; i++) {
+      for (let i = 1; i <= this.n; i++) {
         const di = i - mid;
-        const idx = i + j * ROW_SIZE;
+        const idx = i + j * this.rowSize;
         if (this.pMask[idx]) {
           const xSpanSq = Math.max(0, rSq - dj * dj);
           const ySpanSq = Math.max(0, rSq - di * di);
@@ -774,10 +1031,10 @@ export class CFDEngine {
           if (!this.pMask[idx - 1]) {
             this.wallDeltaW[idx] = Math.max(0.02, Math.min(1.0, i - (mid - xWall)));
           }
-          if (!this.pMask[idx + ROW_SIZE]) {
+          if (!this.pMask[idx + this.rowSize]) {
             this.wallDeltaN[idx] = Math.max(0.02, Math.min(1.0, mid + yWall - j));
           }
-          if (!this.pMask[idx - ROW_SIZE]) {
+          if (!this.pMask[idx - this.rowSize]) {
             this.wallDeltaS[idx] = Math.max(0.02, Math.min(1.0, j - (mid - yWall)));
           }
         }
@@ -788,8 +1045,8 @@ export class CFDEngine {
           let wf = 0;
           if (!this.uMask[idx + 1]) wf += 1 / axisTheta(px, py, 1, 0);
           if (!this.uMask[idx - 1]) wf += 1 / axisTheta(px, py, -1, 0);
-          if (!this.uMask[idx + ROW_SIZE]) wf += 1 / axisTheta(px, py, 0, 1);
-          if (!this.uMask[idx - ROW_SIZE]) wf += 1 / axisTheta(px, py, 0, -1);
+          if (!this.uMask[idx + this.rowSize]) wf += 1 / axisTheta(px, py, 0, 1);
+          if (!this.uMask[idx - this.rowSize]) wf += 1 / axisTheta(px, py, 0, -1);
           this.uWallFactor[idx] = wf;
         }
         if (this.vMask[idx]) {
@@ -798,8 +1055,8 @@ export class CFDEngine {
           let wf = 0;
           if (!this.vMask[idx + 1]) wf += 1 / axisTheta(px, py, 1, 0);
           if (!this.vMask[idx - 1]) wf += 1 / axisTheta(px, py, -1, 0);
-          if (!this.vMask[idx + ROW_SIZE]) wf += 1 / axisTheta(px, py, 0, 1);
-          if (!this.vMask[idx - ROW_SIZE]) wf += 1 / axisTheta(px, py, 0, -1);
+          if (!this.vMask[idx + this.rowSize]) wf += 1 / axisTheta(px, py, 0, 1);
+          if (!this.vMask[idx - this.rowSize]) wf += 1 / axisTheta(px, py, 0, -1);
           this.vWallFactor[idx] = wf;
         }
       }
@@ -811,20 +1068,20 @@ export class CFDEngine {
     p0.cE.fill(0);
     p0.cN.fill(0);
     p0.diag.fill(1);
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!this.pMask[idx]) continue;
         if (this.pMask[idx + 1]) p0.cE[idx] = 1.0;
-        if (this.pMask[idx + ROW_SIZE]) p0.cN[idx] = 1.0;
+        if (this.pMask[idx + this.rowSize]) p0.cN[idx] = 1.0;
       }
     }
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!p0.active[idx]) continue;
         const d =
-          p0.cE[idx - 1] + p0.cE[idx] + p0.cN[idx - ROW_SIZE] + p0.cN[idx];
+          p0.cE[idx - 1] + p0.cE[idx] + p0.cN[idx - this.rowSize] + p0.cN[idx];
         p0.diag[idx] = d > 1e-12 ? d : 1;
       }
     }
@@ -836,7 +1093,11 @@ export class CFDEngine {
     return diameterM / (2 * this.tankRadiusGrid);
   }
 
-  public reset(initialMuPaS?: number): void {
+  public getStressSolveResidual(): number {
+    return this.stressResidual;
+  }
+
+  public reset(initialMuPaS?: number, preserveScales = false): void {
     this.u.fill(0);
     this.v.fill(0);
     this.uTmp.fill(0);
@@ -853,9 +1114,12 @@ export class CFDEngine {
     this.vRodWeight.fill(0);
     this.stirrer.active = false;
     this.elapsedSec = 0;
-    this.emaMaxSpeed = 0.25;
-    this.emaMaxVort = 20;
-    this.emaMaxShear = 5;
+    this.stressResidual = 0;
+    if (!preserveScales) {
+      this.emaMaxSpeed = 0.25;
+      this.emaMaxVort = 20;
+      this.emaMaxShear = 5;
+    }
 
     const muFill = initialMuPaS ?? 0.001;
     this.muApp.fill(muFill);
@@ -863,11 +1127,11 @@ export class CFDEngine {
     const blobRadius = this.tankRadiusGrid * 0.48;
     const sigmaSq = 2 * Math.pow(blobRadius * 0.56, 2);
 
-    for (let j = 1; j <= GRID_N; j++) {
+    for (let j = 1; j <= this.n; j++) {
       const dj = j - this.midGrid;
-      for (let i = 1; i <= GRID_N; i++) {
+      for (let i = 1; i <= this.n; i++) {
         const di = i - this.midGrid;
-        const idx = i + j * ROW_SIZE;
+        const idx = i + j * this.rowSize;
         if (!this.pMask[idx]) continue;
 
         const rSq = di * di + dj * dj;
@@ -888,13 +1152,19 @@ export class CFDEngine {
     dt: number,
     config: FluidConfig
   ): void {
-    if (dt <= 0) return;
+    if (!(dt > 0) || ![x0Norm, y0Norm, x1Norm, y1Norm].every(Number.isFinite)) return;
     const h = this.getCellSizeMeters(config);
-
-    const gx0 = x0Norm * GRID_N + 0.5;
-    const gy0 = y0Norm * GRID_N + 0.5;
-    const gx1 = x1Norm * GRID_N + 0.5;
-    const gy1 = y1Norm * GRID_N + 0.5;
+    const rodRadiusGrid = Math.min(this.tankRadiusGrid * 0.99, config.stirrerDiameterMm * 0.0005 / h);
+    const reachableRadius = this.tankRadiusGrid - rodRadiusGrid;
+    const toCenter = (x: number, y: number): [number, number] => {
+      const dx = (x - 0.5) * this.n;
+      const dy = (y - 0.5) * this.n;
+      const radius = Math.hypot(dx, dy);
+      const scale = radius > reachableRadius ? reachableRadius / radius : 1;
+      return [this.midGrid + dx * scale, this.midGrid + dy * scale];
+    };
+    const [gx0, gy0] = toCenter(x0Norm, y0Norm);
+    const [gx1, gy1] = toCenter(x1Norm, y1Norm);
 
     const segDx = gx1 - gx0;
     const segDy = gy1 - gy0;
@@ -910,20 +1180,22 @@ export class CFDEngine {
       active: true,
       gx0,
       gy0,
-      gx1,
-      gy1,
-      rodRadiusGrid: Math.max(1.8, (config.stirrerDiameterMm * 0.0005) / h),
+      gx1: gx0 + segDx * clampScale,
+      gy1: gy0 + segDy * clampScale,
+      rodRadiusGrid,
       tipVx: segLenSq > 1e-8 ? rawVx * clampScale : 0,
       tipVy: segLenSq > 1e-8 ? rawVy * clampScale : 0,
     };
   }
 
   public step(frameDt: number, config: FluidConfig): void {
-    const dtTotal = Math.min(0.033, Math.max(0.004, frameDt));
+    if (!Number.isFinite(frameDt) || frameDt <= 0) return;
+    const dtTotal = frameDt;
     const h = this.getCellSizeMeters(config);
 
-    let maxVel = Math.hypot(this.stirrer.tipVx, this.stirrer.tipVy);
-    for (let i = 0; i < GRID_SIZE; i++) {
+    const rod = this.stirrer;
+    let maxVel = rod.active ? Math.hypot(rod.tipVx, rod.tipVy) : 0;
+    for (let i = 0; i < this.gridSize; i++) {
       const au = Math.abs(this.u[i]);
       const av = Math.abs(this.v[i]);
       if (au > maxVel) maxVel = au;
@@ -931,133 +1203,177 @@ export class CFDEngine {
     }
 
     const rho = Math.max(200, config.densityKgM3);
-    const effBasePaS = getEffectiveBaseViscosityMpas(config.viscosityMpas) / 1000;
-    const baseNu = effBasePaS / rho;
-    const baseAlphaEst = dtTotal / (rho * h * h);
-    const isViscousDominated = baseNu > 0.02 || baseAlphaEst * effBasePaS > 1.0;
-
+    const mu = getEffectiveBaseViscosityMpas(config.viscosityMpas, config.model) / 1000;
+    const length = Math.max(h, config.stirrerDiameterMm * 0.001);
+    const creeping = config.model === 'newtonian' && rho * maxVel * length / mu < 0.1;
     const cfl = (maxVel * dtTotal) / h;
-    const substeps = isViscousDominated
-      ? 1
-      : cfl > 2.8
-      ? 2
+    const transportSteps = creeping ? 1 : Math.max(1, Math.min(4, Math.ceil(cfl / 1.25)));
+    const tankRadius = this.tankRadiusGrid * h;
+    const modalStiffness = DISK_VISCOUS_MODE_SQUARED * mu * dtTotal / (rho * tankRadius ** 2);
+    const accuracySteps = config.model === 'newtonian' && modalStiffness > 0.9 && modalStiffness <= 4
+      ? Math.ceil(modalStiffness / 0.9)
       : 1;
+    const substeps = Math.max(transportSteps, accuracySteps);
     const dt = dtTotal / substeps;
 
+    const x0 = rod.gx0;
+    const y0 = rod.gy0;
+    const dx = rod.gx1 - x0;
+    const dy = rod.gy1 - y0;
     for (let s = 0; s < substeps; s++) {
-      this.stepSub(dt, h, config);
+      if (rod.active) {
+        rod.gx0 = x0 + dx * s / substeps;
+        rod.gy0 = y0 + dy * s / substeps;
+        rod.gx1 = x0 + dx * (s + 1) / substeps;
+        rod.gy1 = y0 + dy * (s + 1) / substeps;
+      }
+      this.stepSub(dt, h, config, creeping, maxVel, mu, rho);
     }
 
     this.stirrer.active = false;
     this.elapsedSec += dtTotal;
   }
 
-  private buildStirrerPenaltyWeights(baseAlpha: number): void {
+  private buildStirrerPenaltyWeights(baseAlpha: number, dt: number): void {
     this.uRodWeight.fill(0);
     this.vRodWeight.fill(0);
     if (!this.stirrer.active) return;
 
     const { gx0, gy0, gx1, gy1, rodRadiusGrid } = this.stirrer;
-    const segDx = gx1 - gx0;
-    const segDy = gy1 - gy0;
-    const segLenSq = segDx * segDx + segDy * segDy;
-    const searchPad = Math.ceil(rodRadiusGrid) + 2;
+    const centerX = (gx0 + gx1) * 0.5;
+    const centerY = (gy0 + gy1) * 0.5;
+    const searchPad = Math.ceil(rodRadiusGrid) + 1;
 
-    const minI = Math.max(2, Math.floor(Math.min(gx0, gx1) - searchPad));
-    const maxI = Math.min(GRID_N, Math.ceil(Math.max(gx0, gx1) + searchPad));
-    const minJ = Math.max(2, Math.floor(Math.min(gy0, gy1) - searchPad));
-    const maxJ = Math.min(GRID_N, Math.ceil(Math.max(gy0, gy1) + searchPad));
+    const minI = Math.max(2, Math.floor(centerX - searchPad));
+    const maxI = Math.min(this.n, Math.ceil(centerX + searchPad));
+    const minJ = Math.max(2, Math.floor(centerY - searchPad));
+    const maxJ = Math.min(this.n, Math.ceil(centerY + searchPad));
 
     for (let j = minJ; j <= maxJ; j++) {
       for (let i = minI; i <= maxI; i++) {
-        const idx = i + j * ROW_SIZE;
+        const idx = i + j * this.rowSize;
         if (this.uMask[idx]) {
           const px = i - 0.5;
           const py = j;
-          const t =
-            segLenSq > 1e-8
-              ? Math.max(0, Math.min(1, ((px - gx0) * segDx + (py - gy0) * segDy) / segLenSq))
-              : 0;
-          const dist = Math.hypot(px - (gx0 + t * segDx), py - (gy0 + t * segDy));
+          const dist = Math.hypot(px - centerX, py - centerY);
           if (dist < rodRadiusGrid) {
             const s = 1 - dist / rodRadiusGrid;
             const w = s * s * s * (10 + s * (-15 + 6 * s));
             const muLocal = this.muApp[idx];
-            this.uRodWeight[idx] = w * 18 * (1 + 4 * baseAlpha * muLocal);
+            this.uRodWeight[idx] = w * (ROD_PENALTY_RATE * dt + 72 * baseAlpha * muLocal);
           }
         }
         if (this.vMask[idx]) {
           const px = i;
           const py = j - 0.5;
-          const t =
-            segLenSq > 1e-8
-              ? Math.max(0, Math.min(1, ((px - gx0) * segDx + (py - gy0) * segDy) / segLenSq))
-              : 0;
-          const dist = Math.hypot(px - (gx0 + t * segDx), py - (gy0 + t * segDy));
+          const dist = Math.hypot(px - centerX, py - centerY);
           if (dist < rodRadiusGrid) {
             const s = 1 - dist / rodRadiusGrid;
             const w = s * s * s * (10 + s * (-15 + 6 * s));
             const muLocal = this.muApp[idx];
-            this.vRodWeight[idx] = w * 18 * (1 + 4 * baseAlpha * muLocal);
+            this.vRodWeight[idx] = w * (ROD_PENALTY_RATE * dt + 72 * baseAlpha * muLocal);
           }
         }
       }
     }
   }
 
-  private stepSub(dt: number, h: number, config: FluidConfig): void {
-    const rho = Math.max(200, config.densityKgM3);
-
-    this.computeKinematicsAndRheology(h, config);
-
-    const baseNu =
-      getEffectiveBaseViscosityMpas(config.viscosityMpas) / (1000 * rho);
-    const isCreepingStokes = baseNu > 0.02;
-
-    if (!isCreepingStokes) {
-      this.applyVorticityConfinement(dt, h, baseNu);
-      this.advectVelocityMacCormack(dt, h);
-    }
+  private stepSub(
+    dt: number, h: number, config: FluidConfig, creeping: boolean, maxVel: number, mu: number, rho: number,
+  ): void {
+    const maxMu = this.computeKinematicsAndRheology(h, config);
+    if (!creeping) this.advectVelocityMacCormack(dt, h);
 
     const baseAlpha = dt / (rho * h * h);
-    this.buildStirrerPenaltyWeights(baseAlpha);
+    this.buildStirrerPenaltyWeights(baseAlpha, dt);
+    const isViscousCoupled = baseAlpha * maxMu > 0.25;
+    const isNewtonian = config.model === 'newtonian';
+    const tankRadius = this.tankRadiusGrid * h;
+    const modalStiffness = DISK_VISCOUS_MODE_SQUARED * mu * dt / (rho * tankRadius ** 2);
 
-    const effBasePaS = getEffectiveBaseViscosityMpas(config.viscosityMpas) / 1000;
-    const isViscousCoupled = baseAlpha * effBasePaS > 0.25;
-
-    if (isViscousCoupled) {
+    if (creeping && !this.stirrer.active && modalStiffness >= 12 && maxVel * dt / modalStiffness <= 0.1 * h) {
+      // The slowest modeled viscous mode has decayed below e^-12 and traveled less than a tenth of a cell.
+      this.u.fill(0);
+      this.v.fill(0);
+      this.p.fill(0);
+    } else if (isNewtonian && modalStiffness > 4) {
+      this.integrateStiffNewtonianFlow(dt, h, rho);
+    } else if (isViscousCoupled) {
       this.uFwd.set(this.u);
       this.vFwd.set(this.v);
-      this.solveDiffusionGalerkin(dt, h, rho, true, 3, 1e-5);
+      if (isNewtonian) this.solveDiffusionGalerkin(dt, h, rho, true, 3, 1e-5);
+      else this.solveStressDiffusion(dt, h, rho, true, 6);
       this.projectPressureGalerkin(dt, h, rho, true, 3, 1e-5);
+      if (!isNewtonian) {
+        this.computeKinematicsAndRheology(h, config);
+        this.buildStirrerPenaltyWeights(baseAlpha, dt);
+      }
       this.u.set(this.uFwd);
       this.v.set(this.vFwd);
-      this.solveDiffusionGalerkin(dt, h, rho, true, 6, 1e-8);
-      this.projectPressureGalerkin(dt, h, rho, true, 6, 1e-8);
+      if (isNewtonian) this.integrateNewtonianViscosity(dt, h, rho, modalStiffness);
+      else this.solveStressDiffusion(dt, h, rho, true, 18);
+      this.projectPressureGalerkin(dt, h, rho, true);
     } else {
-      this.solveDiffusionGalerkin(dt, h, rho, true, 5, 1e-7);
-      this.projectPressureGalerkin(dt, h, rho, true, 5, 1e-7);
+      if (isNewtonian) this.solveDiffusionGalerkin(dt, h, rho, true, 5, 1e-7);
+      else this.solveStressDiffusion(dt, h, rho, true, 12);
+      this.projectPressureGalerkin(dt, h, rho, true);
     }
 
-    if (isCreepingStokes) {
-      let maxV = 0;
-      for (let i = 0; i < GRID_SIZE; i++) {
-        const av = Math.abs(this.u[i]);
-        const bv = Math.abs(this.v[i]);
-        if (av > maxV) maxV = av;
-        if (bv > maxV) maxV = bv;
-      }
-      const scalarSteps = (maxV * dt) / h > 2.0 ? 2 : 1;
-      const sdt = dt / scalarSteps;
-      for (let k = 0; k < scalarSteps; k++) {
-        this.advectScalarMacCormack(this.dye, this.dyeFwd, this.dyeBwd, this.dyeTmp, sdt, h);
-      }
-      this.updatePlasticWake(dt, h, config, effBasePaS);
-    } else {
-      this.advectScalarMacCormack(this.dye, this.dyeFwd, this.dyeBwd, this.dyeTmp, dt, h);
-      this.updatePlasticWake(dt, h, config, effBasePaS);
-    }
+    this.transportDye(dt, h);
+    this.updatePlasticWake(dt, h, config, mu);
     this.computeKinematicsAndRheology(h, config);
+  }
+
+  private solveStressDiffusion(dt: number, h: number, rho: number, pressure: boolean, iterations: number): void {
+    this.stressSolver ??= new ViscousStressSolver(this.n, this.rowSize, this.pMask, this.uMask, this.vMask);
+    this.stressResidual = this.stressSolver.solve(
+      this.u, this.v, this.p, this.muApp, this.uRodWeight, this.vRodWeight,
+      this.stirrer.tipVx, this.stirrer.tipVy, dt / (rho * h * h), pressure ? dt / (rho * h) : 0, iterations,
+    );
+  }
+
+  private integrateStiffNewtonianFlow(dt: number, h: number, rho: number): void {
+    // Keep the incremental pressure synchronized with the diffusing velocity.
+    const rod = this.stirrer;
+    const { gx0, gy0, gx1, gy1 } = rod;
+    const travel = rod.active ? Math.hypot(gx1 - gx0, gy1 - gy0) : 0;
+    const stages = Math.max(3, Math.min(8, Math.ceil(travel / 0.28)));
+    const stageDt = dt / stages;
+    const alpha = stageDt / (rho * h * h);
+    for (let stage = 0; stage < stages; stage++) {
+      if (rod.active) {
+        rod.gx0 = gx0 + (gx1 - gx0) * stage / stages;
+        rod.gy0 = gy0 + (gy1 - gy0) * stage / stages;
+        rod.gx1 = gx0 + (gx1 - gx0) * (stage + 1) / stages;
+        rod.gy1 = gy0 + (gy1 - gy0) * (stage + 1) / stages;
+        this.buildStirrerPenaltyWeights(alpha, stageDt);
+      }
+      this.solveDiffusionGalerkin(stageDt, h, rho, true, 12, 1e-8);
+      this.projectPressureGalerkin(stageDt, h, rho, true);
+    }
+    rod.gx0 = gx0;
+    rod.gy0 = gy0;
+    rod.gx1 = gx1;
+    rod.gy1 = gy1;
+  }
+
+  private integrateNewtonianViscosity(dt: number, h: number, rho: number, modalStiffness: number): void {
+    if (modalStiffness < 0.025) {
+      this.solveDiffusionGalerkin(dt, h, rho, true, 8, 1e-8);
+      return;
+    }
+
+    this.uBwd.set(this.u);
+    this.vBwd.set(this.v);
+    const fraction = TR_BDF2_GAMMA / 2;
+    const previousWeight = 1 + (1 - TR_BDF2_GAMMA) ** 2;
+    const scale = 1 / (TR_BDF2_GAMMA * (2 - TR_BDF2_GAMMA));
+    this.solveDiffusionGalerkin(dt * fraction, h, rho, true, 10, 1e-8, fraction);
+    for (let i = 0; i < this.gridSize; i++) {
+      this.u[i] = (2 * this.u[i] - previousWeight * this.uBwd[i]) * scale;
+      this.v[i] = (2 * this.v[i] - previousWeight * this.vBwd[i]) * scale;
+    }
+    this.solveDiffusionGalerkin(dt * fraction, h, rho, true, 10, 1e-8, fraction);
   }
 
   private updatePlasticWake(
@@ -1075,13 +1391,13 @@ export class CFDEngine {
       if (speedRod > 0.01) {
         const searchPad = Math.ceil(rodRadiusGrid) + 2;
         const minI = Math.max(2, Math.floor(Math.min(gx0, gx1) - searchPad));
-        const maxI = Math.min(GRID_N, Math.ceil(Math.max(gx0, gx1) + searchPad));
+        const maxI = Math.min(this.n, Math.ceil(Math.max(gx0, gx1) + searchPad));
         const minJ = Math.max(2, Math.floor(Math.min(gy0, gy1) - searchPad));
-        const maxJ = Math.min(GRID_N, Math.ceil(Math.max(gy0, gy1) + searchPad));
+        const maxJ = Math.min(this.n, Math.ceil(Math.max(gy0, gy1) + searchPad));
 
         for (let j = minJ; j <= maxJ; j++) {
           for (let i = minI; i <= maxI; i++) {
-            const idx = i + j * ROW_SIZE;
+            const idx = i + j * this.rowSize;
             if (!this.pMask[idx]) continue;
             const t =
               segLenSq > 1e-8
@@ -1110,9 +1426,9 @@ export class CFDEngine {
         : Math.max(0.02, 0.9 / (1 + Math.pow(effBasePaS, 0.65) * 2.5)) * (1 - 0.92 * yieldRetention);
     const decayFactor = Math.exp(-relaxRate * dt);
 
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!this.pMask[idx]) {
           this.wake[idx] = 0;
           continue;
@@ -1124,14 +1440,15 @@ export class CFDEngine {
     }
   }
 
-  private computeKinematicsAndRheology(h: number, config: FluidConfig): void {
+  private computeKinematicsAndRheology(h: number, config: FluidConfig): number {
     const invH = 1 / h;
     const ucBuf = this.scalarA;
     const vcBuf = this.scalarB;
+    let maxMu = 0;
 
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!this.pMask[idx]) {
           ucBuf[idx] = 0;
           vcBuf[idx] = 0;
@@ -1157,16 +1474,16 @@ export class CFDEngine {
         }
 
         const hasS = this.vMask[idx];
-        const hasN = this.vMask[idx + ROW_SIZE];
+        const hasN = this.vMask[idx + this.rowSize];
         let vc = 0;
         if (hasS && hasN) {
-          vc = 0.5 * (this.v[idx] + this.v[idx + ROW_SIZE]);
+          vc = 0.5 * (this.v[idx] + this.v[idx + this.rowSize]);
         } else if (hasS) {
           const dN = this.wallDeltaN[idx];
           vc = this.v[idx] * (dN / (0.5 + dN));
         } else if (hasN) {
           const dS = this.wallDeltaS[idx];
-          vc = this.v[idx + ROW_SIZE] * (dS / (0.5 + dS));
+          vc = this.v[idx + this.rowSize] * (dS / (0.5 + dS));
         }
 
         ucBuf[idx] = uc;
@@ -1175,9 +1492,9 @@ export class CFDEngine {
       }
     }
 
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!this.pMask[idx]) continue;
 
         const hasW = this.uMask[idx];
@@ -1192,25 +1509,25 @@ export class CFDEngine {
         }
 
         const hasS = this.vMask[idx];
-        const hasN = this.vMask[idx + ROW_SIZE];
+        const hasN = this.vMask[idx + this.rowSize];
         let dvdy = 0;
         if (hasS && hasN) {
-          dvdy = (this.v[idx + ROW_SIZE] - this.v[idx]) * invH;
+          dvdy = (this.v[idx + this.rowSize] - this.v[idx]) * invH;
         } else if (hasS) {
           dvdy = -this.v[idx] / ((0.5 + this.wallDeltaN[idx]) * h);
         } else if (hasN) {
-          dvdy = this.v[idx + ROW_SIZE] / ((0.5 + this.wallDeltaS[idx]) * h);
+          dvdy = this.v[idx + this.rowSize] / ((0.5 + this.wallDeltaS[idx]) * h);
         }
 
-        const pN = this.pMask[idx + ROW_SIZE];
-        const pS = this.pMask[idx - ROW_SIZE];
+        const pN = this.pMask[idx + this.rowSize];
+        const pS = this.pMask[idx - this.rowSize];
         let dudy = 0;
         if (pN && pS) {
-          dudy = (ucBuf[idx + ROW_SIZE] - ucBuf[idx - ROW_SIZE]) * (0.5 * invH);
+          dudy = (ucBuf[idx + this.rowSize] - ucBuf[idx - this.rowSize]) * (0.5 * invH);
         } else if (pS) {
-          dudy = -ucBuf[idx - ROW_SIZE] / ((1 + this.wallDeltaN[idx]) * h);
+          dudy = -ucBuf[idx - this.rowSize] / ((1 + this.wallDeltaN[idx]) * h);
         } else if (pN) {
-          dudy = ucBuf[idx + ROW_SIZE] / ((1 + this.wallDeltaS[idx]) * h);
+          dudy = ucBuf[idx + this.rowSize] / ((1 + this.wallDeltaS[idx]) * h);
         }
 
         const pE = this.pMask[idx + 1];
@@ -1229,43 +1546,17 @@ export class CFDEngine {
         this.absVort[idx] = Math.abs(vort);
 
         const gamma = Math.sqrt(
-          2 * dudx * dudx + 2 * dvdy * dvdy + (dudy + dvdx) * (dudy + dvdx) + 1e-6
+          2 * dudx * dudx + 2 * dvdy * dvdy + (dudy + dvdx) * (dudy + dvdx)
         );
         this.shearRate[idx] = gamma;
 
         const mu = computeApparentViscosityPaS(gamma, config);
         this.muApp[idx] = mu;
         this.shearStress[idx] = mu * gamma;
+        maxMu = Math.max(maxMu, mu);
       }
     }
-  }
-
-  private applyVorticityConfinement(dt: number, h: number, baseNu: number): void {
-    const reScale = Math.max(0, Math.min(1, (1e-5 / Math.max(baseNu, 1e-8) - 0.15) * 0.25));
-    if (reScale <= 0.01) return;
-
-    const eps = 1.6 * h * reScale * dt;
-
-    for (let j = 2; j < GRID_N; j++) {
-      let idx = 2 + j * ROW_SIZE;
-      for (let i = 2; i < GRID_N; i++, idx++) {
-        if (!this.pMask[idx]) continue;
-
-        const dwDx = (this.absVort[idx + 1] - this.absVort[idx - 1]) * (0.5 / h);
-        const dwDy = (this.absVort[idx + ROW_SIZE] - this.absVort[idx - ROW_SIZE]) * (0.5 / h);
-        const len = Math.hypot(dwDx, dwDy) + 1e-6;
-        const nx = dwDx / len;
-        const ny = dwDy / len;
-
-        const fx = ny * this.vorticity[idx] * eps;
-        const fy = -nx * this.vorticity[idx] * eps;
-
-        if (this.uMask[idx]) this.u[idx] += fx;
-        if (this.uMask[idx + 1]) this.u[idx + 1] += fx;
-        if (this.vMask[idx]) this.v[idx] += fy;
-        if (this.vMask[idx + ROW_SIZE]) this.v[idx + ROW_SIZE] += fy;
-      }
-    }
+    return maxMu;
   }
 
   private sampleFace(
@@ -1274,17 +1565,17 @@ export class CFDEngine {
     gy: number,
     isU: boolean
   ): [number, number, number] {
-    const maxX = isU ? GRID_N + 0.999 : GRID_N - 0.001;
-    const maxY = isU ? GRID_N - 0.001 : GRID_N + 0.999;
+    const maxX = isU ? this.n + 0.999 : this.n - 0.001;
+    const maxY = isU ? this.n - 0.001 : this.n + 0.999;
     const x = gx < 1 ? 1 : gx > maxX ? maxX : gx;
     const y = gy < 1 ? 1 : gy > maxY ? maxY : gy;
     const i0 = x | 0;
     const j0 = y | 0;
     const sx = x - i0;
     const sy = y - j0;
-    const idx00 = i0 + j0 * ROW_SIZE;
+    const idx00 = i0 + j0 * this.rowSize;
     const idx10 = idx00 + 1;
-    const idx01 = idx00 + ROW_SIZE;
+    const idx01 = idx00 + this.rowSize;
     const idx11 = idx01 + 1;
 
     const q00 = src[idx00];
@@ -1298,6 +1589,17 @@ export class CFDEngine {
     return [val, minV, maxV];
   }
 
+  private traceFace(
+    field: Float32Array, i: number, j: number, vx: number, vy: number, step: number, isU: boolean,
+  ): [number, number, number] {
+    const midX = i - 0.5 * step * vx;
+    const midY = j - 0.5 * step * vy;
+    const offset = isU ? 0 : 0.5;
+    const u = this.sampleFace(this.u, midX + offset, midY - offset, true)[0];
+    const v = this.sampleFace(this.v, midX + offset - 0.5, midY - offset + 0.5, false)[0];
+    return this.sampleFace(field, i - step * u, j - step * v, isU);
+  }
+
   private advectVelocityMacCormack(dt: number, h: number): void {
     const dtOverH = dt / h;
     const u = this.u;
@@ -1306,19 +1608,19 @@ export class CFDEngine {
     this.uFwd.set(u);
     this.vFwd.set(v);
 
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (this.uMask[idx]) {
           const vx = u[idx];
-          const vy = 0.25 * (v[idx - 1] + v[idx] + v[idx - 1 + ROW_SIZE] + v[idx + ROW_SIZE]);
-          const [val] = this.sampleFace(u, i - dtOverH * vx, j - dtOverH * vy, true);
+          const vy = 0.25 * (v[idx - 1] + v[idx] + v[idx - 1 + this.rowSize] + v[idx + this.rowSize]);
+          const [val] = this.traceFace(u, i, j, vx, vy, dtOverH, true);
           this.uFwd[idx] = val;
         }
         if (this.vMask[idx]) {
-          const vx = 0.25 * (u[idx - ROW_SIZE] + u[idx + 1 - ROW_SIZE] + u[idx] + u[idx + 1]);
+          const vx = 0.25 * (u[idx - this.rowSize] + u[idx + 1 - this.rowSize] + u[idx] + u[idx + 1]);
           const vy = v[idx];
-          const [val] = this.sampleFace(v, i - dtOverH * vx, j - dtOverH * vy, false);
+          const [val] = this.traceFace(v, i, j, vx, vy, dtOverH, false);
           this.vFwd[idx] = val;
         }
       }
@@ -1327,31 +1629,31 @@ export class CFDEngine {
     this.uBwd.set(this.uFwd);
     this.vBwd.set(this.vFwd);
 
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (this.uMask[idx]) {
           const vx = u[idx];
-          const vy = 0.25 * (v[idx - 1] + v[idx] + v[idx - 1 + ROW_SIZE] + v[idx + ROW_SIZE]);
-          const [val] = this.sampleFace(this.uFwd, i + dtOverH * vx, j + dtOverH * vy, true);
+          const vy = 0.25 * (v[idx - 1] + v[idx] + v[idx - 1 + this.rowSize] + v[idx + this.rowSize]);
+          const [val] = this.traceFace(this.uFwd, i, j, vx, vy, -dtOverH, true);
           this.uBwd[idx] = val;
         }
         if (this.vMask[idx]) {
-          const vx = 0.25 * (u[idx - ROW_SIZE] + u[idx + 1 - ROW_SIZE] + u[idx] + u[idx + 1]);
+          const vx = 0.25 * (u[idx - this.rowSize] + u[idx + 1 - this.rowSize] + u[idx] + u[idx + 1]);
           const vy = v[idx];
-          const [val] = this.sampleFace(this.vFwd, i + dtOverH * vx, j + dtOverH * vy, false);
+          const [val] = this.traceFace(this.vFwd, i, j, vx, vy, -dtOverH, false);
           this.vBwd[idx] = val;
         }
       }
     }
 
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (this.uMask[idx]) {
           const vx = u[idx];
-          const vy = 0.25 * (v[idx - 1] + v[idx] + v[idx - 1 + ROW_SIZE] + v[idx + ROW_SIZE]);
-          const [fwd, minV, maxV] = this.sampleFace(u, i - dtOverH * vx, j - dtOverH * vy, true);
+          const vy = 0.25 * (v[idx - 1] + v[idx] + v[idx - 1 + this.rowSize] + v[idx + this.rowSize]);
+          const [fwd, minV, maxV] = this.traceFace(u, i, j, vx, vy, dtOverH, true);
           const corr = fwd + 0.5 * (u[idx] - this.uBwd[idx]);
           this.uTmp[idx] = corr < minV ? minV : corr > maxV ? maxV : corr;
         } else {
@@ -1359,9 +1661,9 @@ export class CFDEngine {
         }
 
         if (this.vMask[idx]) {
-          const vx = 0.25 * (u[idx - ROW_SIZE] + u[idx + 1 - ROW_SIZE] + u[idx] + u[idx + 1]);
+          const vx = 0.25 * (u[idx - this.rowSize] + u[idx + 1 - this.rowSize] + u[idx] + u[idx + 1]);
           const vy = v[idx];
-          const [fwd, minV, maxV] = this.sampleFace(v, i - dtOverH * vx, j - dtOverH * vy, false);
+          const [fwd, minV, maxV] = this.traceFace(v, i, j, vx, vy, dtOverH, false);
           const corr = fwd + 0.5 * (v[idx] - this.vBwd[idx]);
           this.vTmp[idx] = corr < minV ? minV : corr > maxV ? maxV : corr;
         } else {
@@ -1380,7 +1682,8 @@ export class CFDEngine {
     rho: number,
     includePressure: boolean,
     maxIter: number,
-    relTol: number
+    relTol: number,
+    rodScale = 1
   ): void {
     const baseAlpha = dt / (rho * h * h);
     const invScale = includePressure ? dt / (rho * h) : 0;
@@ -1395,7 +1698,8 @@ export class CFDEngine {
       invScale,
       1,
       maxIter,
-      relTol
+      relTol,
+      rodScale
     );
     this.solveComponentDiffusionGalerkin(
       this.v,
@@ -1405,9 +1709,10 @@ export class CFDEngine {
       this.stirrer.tipVy,
       baseAlpha,
       invScale,
-      ROW_SIZE,
+      this.rowSize,
       maxIter,
-      relTol
+      relTol,
+      rodScale
     );
   }
 
@@ -1421,7 +1726,8 @@ export class CFDEngine {
     invScale: number,
     gradStride: number,
     maxIter: number,
-    relTol: number
+    relTol: number,
+    rodScale: number
   ): void {
     const l0 = this.diffLevels[0];
     l0.active.set(mask);
@@ -1441,9 +1747,9 @@ export class CFDEngine {
 
     const mu = this.muApp;
     const p = this.p;
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!mask[idx]) continue;
 
         const mC = mu[idx];
@@ -1451,13 +1757,13 @@ export class CFDEngine {
           const mNb = mu[idx + 1];
           l0.cE[idx] = baseAlpha * ((2 * mC * mNb) / (mC + mNb + 1e-12));
         }
-        if (mask[idx + ROW_SIZE]) {
-          const mNb = mu[idx + ROW_SIZE];
+        if (mask[idx + this.rowSize]) {
+          const mNb = mu[idx + this.rowSize];
           l0.cN[idx] = baseAlpha * ((2 * mC * mNb) / (mC + mNb + 1e-12));
         }
 
         const wallDiag = baseAlpha * mC * wallFactor[idx];
-        const rw = rodWeight[idx];
+        const rw = rodWeight[idx] * rodScale;
         l0.selfDiag[idx] = 1.0 + rw + wallDiag;
 
         const pGrad = invScale > 0 ? invScale * (p[idx] - p[idx - gradStride]) : 0;
@@ -1467,15 +1773,15 @@ export class CFDEngine {
       }
     }
 
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!mask[idx]) continue;
         l0.diag[idx] =
           l0.selfDiag[idx] +
           l0.cE[idx - 1] +
           l0.cE[idx] +
-          l0.cN[idx - ROW_SIZE] +
+          l0.cN[idx - this.rowSize] +
           l0.cN[idx];
       }
     }
@@ -1487,16 +1793,16 @@ export class CFDEngine {
     const cN = l0.cN;
 
     let r0Sq = 0;
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!mask[idx]) continue;
         const ax =
           diag[idx] * cgX[idx] -
           (cE[idx - 1] * cgX[idx - 1] +
             cE[idx] * cgX[idx + 1] +
-            cN[idx - ROW_SIZE] * cgX[idx - ROW_SIZE] +
-            cN[idx] * cgX[idx + ROW_SIZE]);
+            cN[idx - this.rowSize] * cgX[idx - this.rowSize] +
+            cN[idx] * cgX[idx + this.rowSize]);
         const rVal = cgR[idx] - ax;
         cgR[idx] = rVal;
         r0Sq += rVal * rVal;
@@ -1506,7 +1812,7 @@ export class CFDEngine {
     if (r0Sq > 1e-18) {
       l0.rhs.set(cgR);
       l0.x.fill(0);
-      runGalerkinVCycle(this.diffLevels, 0, 1, 2, 8);
+      runGalerkinVCycle(this.diffLevels, 0, PCG_SMOOTHING_SWEEPS, PCG_SMOOTHING_SWEEPS, 8);
 
       let rzOld = 0;
       for (let i = 0; i < l0.size; i++) {
@@ -1518,16 +1824,16 @@ export class CFDEngine {
 
       for (let iter = 0; iter < maxIter; iter++) {
         let pAp = 0;
-        for (let j = 1; j <= GRID_N; j++) {
-          let idx = 1 + j * ROW_SIZE;
-          for (let i = 1; i <= GRID_N; i++, idx++) {
+        for (let j = 1; j <= this.n; j++) {
+          let idx = 1 + j * this.rowSize;
+          for (let i = 1; i <= this.n; i++, idx++) {
             if (!mask[idx]) continue;
             const ap =
               diag[idx] * cgP[idx] -
               (cE[idx - 1] * cgP[idx - 1] +
                 cE[idx] * cgP[idx + 1] +
-                cN[idx - ROW_SIZE] * cgP[idx - ROW_SIZE] +
-                cN[idx] * cgP[idx + ROW_SIZE]);
+                cN[idx - this.rowSize] * cgP[idx - this.rowSize] +
+                cN[idx] * cgP[idx + this.rowSize]);
             cgAp[idx] = ap;
             pAp += cgP[idx] * ap;
           }
@@ -1549,7 +1855,7 @@ export class CFDEngine {
 
         l0.rhs.set(cgR);
         l0.x.fill(0);
-        runGalerkinVCycle(this.diffLevels, 0, 1, 2, 8);
+        runGalerkinVCycle(this.diffLevels, 0, PCG_SMOOTHING_SWEEPS, PCG_SMOOTHING_SWEEPS, 8);
 
         let rzNew = 0;
         for (let i = 0; i < l0.size; i++) {
@@ -1574,8 +1880,8 @@ export class CFDEngine {
     h: number,
     rho: number,
     incremental: boolean,
-    maxIter: number,
-    relTol: number
+    maxIter = PRESSURE_MAX_ITERATIONS,
+    relTol = PRESSURE_RESIDUAL_TOLERANCE_SQ
   ): void {
     const p0 = this.pressLevels[0];
     const scale = (rho * h) / dt;
@@ -1591,11 +1897,11 @@ export class CFDEngine {
     cgAp.fill(0);
 
     let divSum = 0;
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!pMask[idx]) continue;
-        const divH = this.u[idx + 1] - this.u[idx] + this.v[idx + ROW_SIZE] - this.v[idx];
+        const divH = this.u[idx + 1] - this.u[idx] + this.v[idx + this.rowSize] - this.v[idx];
         this.uTmp[idx] = divH / h;
         const rawDiv = -divH * scale;
         cgR[idx] = rawDiv;
@@ -1614,16 +1920,16 @@ export class CFDEngine {
     const cN = p0.cN;
 
     let r0Sq = 0;
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!pMask[idx]) continue;
         const ax =
           diag[idx] * cgX[idx] -
           (cE[idx - 1] * cgX[idx - 1] +
             cE[idx] * cgX[idx + 1] +
-            cN[idx - ROW_SIZE] * cgX[idx - ROW_SIZE] +
-            cN[idx] * cgX[idx + ROW_SIZE]);
+            cN[idx - this.rowSize] * cgX[idx - this.rowSize] +
+            cN[idx] * cgX[idx + this.rowSize]);
         const rVal = cgR[idx] - ax;
         cgR[idx] = rVal;
         r0Sq += rVal * rVal;
@@ -1633,7 +1939,7 @@ export class CFDEngine {
     if (r0Sq > 1e-18) {
       p0.rhs.set(cgR);
       p0.x.fill(0);
-      runGalerkinVCycle(this.pressLevels, 0, 1, 2, 10);
+      runGalerkinVCycle(this.pressLevels, 0, PCG_SMOOTHING_SWEEPS, PCG_SMOOTHING_SWEEPS, 10);
 
       let rzOld = 0;
       for (let i = 0; i < p0.size; i++) {
@@ -1645,16 +1951,16 @@ export class CFDEngine {
 
       for (let iter = 0; iter < maxIter; iter++) {
         let pAp = 0;
-        for (let j = 1; j <= GRID_N; j++) {
-          let idx = 1 + j * ROW_SIZE;
-          for (let i = 1; i <= GRID_N; i++, idx++) {
+        for (let j = 1; j <= this.n; j++) {
+          let idx = 1 + j * this.rowSize;
+          for (let i = 1; i <= this.n; i++, idx++) {
             if (!pMask[idx]) continue;
             const ap =
               diag[idx] * cgP[idx] -
               (cE[idx - 1] * cgP[idx - 1] +
                 cE[idx] * cgP[idx + 1] +
-                cN[idx - ROW_SIZE] * cgP[idx - ROW_SIZE] +
-                cN[idx] * cgP[idx + ROW_SIZE]);
+                cN[idx - this.rowSize] * cgP[idx - this.rowSize] +
+                cN[idx] * cgP[idx + this.rowSize]);
             cgAp[idx] = ap;
             pAp += cgP[idx] * ap;
           }
@@ -1676,7 +1982,7 @@ export class CFDEngine {
 
         p0.rhs.set(cgR);
         p0.x.fill(0);
-        runGalerkinVCycle(this.pressLevels, 0, 1, 2, 10);
+        runGalerkinVCycle(this.pressLevels, 0, PCG_SMOOTHING_SWEEPS, PCG_SMOOTHING_SWEEPS, 10);
 
         let rzNew = 0;
         for (let i = 0; i < p0.size; i++) {
@@ -1708,16 +2014,16 @@ export class CFDEngine {
     }
 
     const invScale = dt / (rho * h);
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (this.uMask[idx]) {
           this.u[idx] -= invScale * (cgX[idx] - cgX[idx - 1]);
         } else {
           this.u[idx] = 0;
         }
         if (this.vMask[idx]) {
-          this.v[idx] -= invScale * (cgX[idx] - cgX[idx - ROW_SIZE]);
+          this.v[idx] -= invScale * (cgX[idx] - cgX[idx - this.rowSize]);
         } else {
           this.v[idx] = 0;
         }
@@ -1738,21 +2044,21 @@ export class CFDEngine {
       y = this.midGrid + dy * scale;
     }
     if (x < 1) x = 1;
-    if (x > GRID_N - 0.001) x = GRID_N - 0.001;
+    if (x > this.n - 0.001) x = this.n - 0.001;
     if (y < 1) y = 1;
-    if (y > GRID_N - 0.001) y = GRID_N - 0.001;
+    if (y > this.n - 0.001) y = this.n - 0.001;
 
     const i0 = x | 0;
     const j0 = y | 0;
     const sx = x - i0;
     const sy = y - j0;
 
-    const idx00 = i0 + j0 * ROW_SIZE;
+    const idx00 = i0 + j0 * this.rowSize;
     const idx10 = idx00 + 1;
-    const idx01 = idx00 + ROW_SIZE;
+    const idx01 = idx00 + this.rowSize;
     const idx11 = idx01 + 1;
 
-    const centerVal = src[Math.round(y) + Math.round(x) * ROW_SIZE];
+    const centerVal = src[Math.round(x) + Math.round(y) * this.rowSize];
     const q00 = this.pMask[idx00] ? src[idx00] : centerVal;
     const q10 = this.pMask[idx10] ? src[idx10] : centerVal;
     const q01 = this.pMask[idx01] ? src[idx01] : centerVal;
@@ -1774,43 +2080,43 @@ export class CFDEngine {
   ): void {
     const dtOverH = dt / h;
 
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!this.pMask[idx]) {
           fwdBuf[idx] = 0;
           continue;
         }
         const vx = 0.5 * (this.u[idx] + this.u[idx + 1]);
-        const vy = 0.5 * (this.v[idx] + this.v[idx + ROW_SIZE]);
+        const vy = 0.5 * (this.v[idx] + this.v[idx + this.rowSize]);
         const [val] = this.sampleCellScalar(field, i - dtOverH * vx, j - dtOverH * vy);
         fwdBuf[idx] = val;
       }
     }
 
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!this.pMask[idx]) {
           bwdBuf[idx] = 0;
           continue;
         }
         const vx = 0.5 * (this.u[idx] + this.u[idx + 1]);
-        const vy = 0.5 * (this.v[idx] + this.v[idx + ROW_SIZE]);
+        const vy = 0.5 * (this.v[idx] + this.v[idx + this.rowSize]);
         const [val] = this.sampleCellScalar(fwdBuf, i + dtOverH * vx, j + dtOverH * vy);
         bwdBuf[idx] = val;
       }
     }
 
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!this.pMask[idx]) {
           tmpBuf[idx] = 0;
           continue;
         }
         const vx = 0.5 * (this.u[idx] + this.u[idx + 1]);
-        const vy = 0.5 * (this.v[idx] + this.v[idx + ROW_SIZE]);
+        const vy = 0.5 * (this.v[idx] + this.v[idx + this.rowSize]);
         const [fwd, minV, maxV] = this.sampleCellScalar(field, i - dtOverH * vx, j - dtOverH * vy);
         const corr = fwd + 0.5 * (field[idx] - bwdBuf[idx]);
         const clamped = corr < minV ? minV : corr > maxV ? maxV : corr;
@@ -1821,13 +2127,52 @@ export class CFDEngine {
     field.set(tmpBuf);
   }
 
+  private transportDye(dt: number, h: number): void {
+    let maxOutflow = 0;
+    for (let i = 0; i < this.gridSize; i++) {
+      if (!this.pMask[i]) continue;
+      const outflow =
+        Math.max(0, -this.u[i]) + Math.max(0, this.u[i + 1]) +
+        Math.max(0, -this.v[i]) + Math.max(0, this.v[i + this.rowSize]);
+      maxOutflow = Math.max(maxOutflow, outflow);
+    }
+    if (maxOutflow === 0) return;
+
+    // Limit the volume leaving any cell and transfer equal fluxes across shared MAC faces.
+    const steps = Math.max(1, Math.ceil((dt * maxOutflow) / (0.9 * h)));
+    const scale = dt / (steps * h);
+    for (let step = 0; step < steps; step++) {
+      this.dyeTmp.set(this.dye);
+      for (let i = 0; i < this.gridSize; i++) {
+        if (!this.pMask[i]) continue;
+        const east = i + 1;
+        const north = i + this.rowSize;
+        if (this.uMask[east]) {
+          const speed = this.u[east];
+          const flux = scale * speed * this.dye[speed >= 0 ? i : east];
+          this.dyeTmp[i] -= flux;
+          this.dyeTmp[east] += flux;
+        }
+        if (this.vMask[north]) {
+          const speed = this.v[north];
+          const flux = scale * speed * this.dye[speed >= 0 ? i : north];
+          this.dyeTmp[i] -= flux;
+          this.dyeTmp[north] += flux;
+        }
+      }
+      const previous = this.dye;
+      this.dye = this.dyeTmp;
+      this.dyeTmp = previous;
+    }
+  }
+
   private computeDyeVariance(): number {
     let sum = 0;
     let sumSq = 0;
     const count = this.fluidCellCount || 1;
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!this.pMask[idx]) continue;
         const c = this.dye[idx];
         sum += c;
@@ -1846,12 +2191,12 @@ export class CFDEngine {
     }
   }
 
-  private updateScalesAndPrepareFields(mode: VisualizationMode): void {
+  private updateScalesAndPrepareFields(mode: VisualizationMode, scaleLocked: boolean): void {
     if (mode === 'fluid') {
       this.scalarA.set(this.wake);
-      for (let j = 1; j <= GRID_N; j++) {
-        let idx = 1 + j * ROW_SIZE;
-        for (let i = 1; i <= GRID_N; i++, idx++) {
+      for (let j = 1; j <= this.n; j++) {
+        let idx = 1 + j * this.rowSize;
+        for (let i = 1; i <= this.n; i++, idx++) {
           if (!this.pMask[idx]) continue;
           const s = this.speedField[idx] * 0.55;
           this.scalarB[idx] = s > 1 ? 1 : s;
@@ -1864,17 +2209,17 @@ export class CFDEngine {
 
     if (mode === 'velocity') {
       let instMax = 0;
-      for (let j = 1; j <= GRID_N; j++) {
-        let idx = 1 + j * ROW_SIZE;
-        for (let i = 1; i <= GRID_N; i++, idx++) {
+      for (let j = 1; j <= this.n; j++) {
+        let idx = 1 + j * this.rowSize;
+        for (let i = 1; i <= this.n; i++, idx++) {
           if (this.pMask[idx] && this.speedField[idx] > instMax) instMax = this.speedField[idx];
         }
       }
-      this.emaMaxSpeed = this.emaMaxSpeed * 0.92 + Math.max(0.15, instMax) * 0.08;
+      if (!scaleLocked) this.emaMaxSpeed = this.emaMaxSpeed * 0.92 + Math.max(0.15, instMax) * 0.08;
       const invMax = 1 / this.emaMaxSpeed;
-      for (let j = 1; j <= GRID_N; j++) {
-        let idx = 1 + j * ROW_SIZE;
-        for (let i = 1; i <= GRID_N; i++, idx++) {
+      for (let j = 1; j <= this.n; j++) {
+        let idx = 1 + j * this.rowSize;
+        for (let i = 1; i <= this.n; i++, idx++) {
           if (!this.pMask[idx]) continue;
           const v = this.speedField[idx] * invMax;
           this.scalarA[idx] = v > 1 ? 1 : v;
@@ -1882,17 +2227,17 @@ export class CFDEngine {
       }
     } else if (mode === 'vorticity') {
       let instMax = 0;
-      for (let j = 1; j <= GRID_N; j++) {
-        let idx = 1 + j * ROW_SIZE;
-        for (let i = 1; i <= GRID_N; i++, idx++) {
+      for (let j = 1; j <= this.n; j++) {
+        let idx = 1 + j * this.rowSize;
+        for (let i = 1; i <= this.n; i++, idx++) {
           if (this.pMask[idx] && this.absVort[idx] > instMax) instMax = this.absVort[idx];
         }
       }
-      this.emaMaxVort = this.emaMaxVort * 0.92 + Math.max(8, instMax) * 0.08;
+      if (!scaleLocked) this.emaMaxVort = this.emaMaxVort * 0.92 + Math.max(8, instMax) * 0.08;
       const inv2Max = 0.5 / this.emaMaxVort;
-      for (let j = 1; j <= GRID_N; j++) {
-        let idx = 1 + j * ROW_SIZE;
-        for (let i = 1; i <= GRID_N; i++, idx++) {
+      for (let j = 1; j <= this.n; j++) {
+        let idx = 1 + j * this.rowSize;
+        for (let i = 1; i <= this.n; i++, idx++) {
           if (!this.pMask[idx]) continue;
           const v = 0.5 + this.vorticity[idx] * inv2Max;
           this.scalarA[idx] = v < 0 ? 0 : v > 1 ? 1 : v;
@@ -1900,17 +2245,17 @@ export class CFDEngine {
       }
     } else {
       let instMax = 0;
-      for (let j = 1; j <= GRID_N; j++) {
-        let idx = 1 + j * ROW_SIZE;
-        for (let i = 1; i <= GRID_N; i++, idx++) {
+      for (let j = 1; j <= this.n; j++) {
+        let idx = 1 + j * this.rowSize;
+        for (let i = 1; i <= this.n; i++, idx++) {
           if (this.pMask[idx] && this.shearStress[idx] > instMax) instMax = this.shearStress[idx];
         }
       }
-      this.emaMaxShear = this.emaMaxShear * 0.92 + Math.max(0.5, instMax) * 0.08;
+      if (!scaleLocked) this.emaMaxShear = this.emaMaxShear * 0.92 + Math.max(0.5, instMax) * 0.08;
       const invMax = 1 / this.emaMaxShear;
-      for (let j = 1; j <= GRID_N; j++) {
-        let idx = 1 + j * ROW_SIZE;
-        for (let i = 1; i <= GRID_N; i++, idx++) {
+      for (let j = 1; j <= this.n; j++) {
+        let idx = 1 + j * this.rowSize;
+        for (let i = 1; i <= this.n; i++, idx++) {
           if (!this.pMask[idx]) continue;
           const v = this.shearStress[idx] * invMax;
           this.scalarA[idx] = v > 1 ? 1 : v;
@@ -1926,9 +2271,10 @@ export class CFDEngine {
     width: number,
     height: number,
     mode: VisualizationMode,
-    colorHex: string
+    colorHex: string,
+    scaleLocked = false,
   ): ScaleRange {
-    this.updateScalesAndPrepareFields(mode);
+    this.updateScalesAndPrepareFields(mode, scaleLocked);
     const [tr, tg, tb] = parseHexColor(colorHex);
 
     if (this.glRenderer) {
@@ -1946,10 +2292,10 @@ export class CFDEngine {
       const b = this.scalarB;
       const isFluid = mode === 'fluid';
 
-      for (let j = 1; j <= GRID_N; j++) {
-        let idx = 1 + j * ROW_SIZE;
-        let out = (j - 1) * GRID_N * 4;
-        for (let i = 1; i <= GRID_N; i++, idx++, out += 4) {
+      for (let j = 1; j <= this.n; j++) {
+        let idx = 1 + j * this.rowSize;
+        let out = (j - 1) * this.n * 4;
+        for (let i = 1; i <= this.n; i++, idx++, out += 4) {
           bytes[out] = (a[idx] * 255 + 0.5) | 0;
           bytes[out + 1] = isFluid ? (b[idx] * 255 + 0.5) | 0 : 0;
           bytes[out + 2] = 0;
@@ -1964,8 +2310,8 @@ export class CFDEngine {
         0,
         0,
         0,
-        GRID_N,
-        GRID_N,
+        this.n,
+        this.n,
         gl.RGBA,
         gl.UNSIGNED_BYTE,
         bytes
@@ -2002,10 +2348,10 @@ export class CFDEngine {
             ? SHEAR_LUT
             : null;
 
-        for (let j = 1; j <= GRID_N; j++) {
-          let idx = 1 + j * ROW_SIZE;
-          let pIdx = (j - 1) * GRID_N;
-          for (let i = 1; i <= GRID_N; i++, idx++, pIdx++) {
+        for (let j = 1; j <= this.n; j++) {
+          let idx = 1 + j * this.rowSize;
+          let pIdx = (j - 1) * this.n;
+          for (let i = 1; i <= this.n; i++, idx++, pIdx++) {
             if (!this.pMask[idx]) {
               this.fallbackBuf32[pIdx] = bgPixel;
               continue;
@@ -2081,8 +2427,8 @@ export class CFDEngine {
 
   public drawVectorOverlay(ctx: CanvasRenderingContext2D, width: number, height: number): void {
     const step = 6;
-    const scaleX = width / GRID_N;
-    const scaleY = height / GRID_N;
+    const scaleX = width / this.n;
+    const scaleY = height / this.n;
     const maxLen = step * scaleX * 0.78;
     const refSpeed = Math.max(0.2, this.emaMaxSpeed);
 
@@ -2090,13 +2436,13 @@ export class CFDEngine {
     ctx.lineWidth = 1.1;
     ctx.beginPath();
 
-    for (let j = 3; j <= GRID_N - 2; j += step) {
-      for (let i = 3; i <= GRID_N - 2; i += step) {
-        const idx = i + j * ROW_SIZE;
+    for (let j = 3; j <= this.n - 2; j += step) {
+      for (let i = 3; i <= this.n - 2; i += step) {
+        const idx = i + j * this.rowSize;
         if (!this.pMask[idx]) continue;
 
         const uc = 0.5 * (this.u[idx] + this.u[idx + 1]);
-        const vc = 0.5 * (this.v[idx] + this.v[idx + ROW_SIZE]);
+        const vc = 0.5 * (this.v[idx] + this.v[idx + this.rowSize]);
         const sp = Math.hypot(uc, vc);
         if (sp < 0.005) continue;
 
@@ -2123,9 +2469,9 @@ export class CFDEngine {
   }
 
   public sampleProbe(xNorm: number, yNorm: number, config: FluidConfig): ProbeSample {
-    const i = Math.round(xNorm * GRID_N + 0.5);
-    const j = Math.round(yNorm * GRID_N + 0.5);
-    if (i < 1 || i > GRID_N || j < 1 || j > GRID_N) {
+    const i = Math.round(xNorm * this.n + 0.5);
+    const j = Math.round(yNorm * this.n + 0.5);
+    if (i < 1 || i > this.n || j < 1 || j > this.n) {
       return {
         active: false,
         rMm: 0,
@@ -2139,7 +2485,7 @@ export class CFDEngine {
       };
     }
 
-    const idx = i + j * ROW_SIZE;
+    const idx = i + j * this.rowSize;
     if (!this.pMask[idx]) {
       return {
         active: false,
@@ -2182,9 +2528,9 @@ export class CFDEngine {
     let sumMu = 0;
     let sumSpeedSq = 0;
 
-    for (let j = 1; j <= GRID_N; j++) {
-      let idx = 1 + j * ROW_SIZE;
-      for (let i = 1; i <= GRID_N; i++, idx++) {
+    for (let j = 1; j <= this.n; j++) {
+      let idx = 1 + j * this.rowSize;
+      for (let i = 1; i <= this.n; i++, idx++) {
         if (!this.pMask[idx]) continue;
         const sp = this.speedField[idx];
         if (sp > maxSpeed) maxSpeed = sp;
@@ -2200,19 +2546,7 @@ export class CFDEngine {
     const meanShearRate = sumShear / count;
     const effMuPaS = sumMu / count;
     const charLengthM = Math.max(0.005, config.stirrerDiameterMm * 0.001);
-    const charVelMs = Math.max(0.01, maxSpeed);
-    const reynolds = (config.densityKgM3 * charVelMs * charLengthM) / Math.max(1e-6, effMuPaS);
-
-    let regime: SimulationMetrics['regime'] = 'Laminare';
-    if (reynolds < 1) {
-      regime = 'Stokes / Creeping';
-    } else if (reynolds < 2300) {
-      regime = 'Laminare';
-    } else if (reynolds < 4000) {
-      regime = 'Transizione';
-    } else {
-      regime = 'Turbolento';
-    }
+    const reynolds = (config.densityKgM3 * maxSpeed * charLengthM) / Math.max(1e-6, effMuPaS);
 
     const variance = this.computeDyeVariance();
     const intensityOfSegregation = Math.min(1, variance / Math.max(1e-5, this.refVariance));
@@ -2222,7 +2556,6 @@ export class CFDEngine {
     return {
       elapsedSec: this.elapsedSec,
       reynolds,
-      regime,
       maxSpeedMs: maxSpeed,
       meanShearRate,
       maxShearRate,
@@ -2231,6 +2564,7 @@ export class CFDEngine {
       mixingIndex,
       kineticEnergyMjKg,
       scaleRange,
+      stressSolveResidual: this.stressResidual,
     };
   }
 }

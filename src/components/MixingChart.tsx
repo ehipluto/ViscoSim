@@ -1,12 +1,15 @@
 import React from 'react';
 import { TimeSeriesPoint } from '../types/rheology';
 import InfoTooltip from './InfoTooltip';
+import { copy, formatReading, type Language } from '../locale';
 
 interface MixingChartProps {
+  language: Language;
   history: TimeSeriesPoint[];
 }
 
-const MixingChart: React.FC<MixingChartProps> = ({ history }) => {
+const MixingChart: React.FC<MixingChartProps> = ({ language, history }) => {
+  const t = copy[language];
   const width = 520;
   const height = 175;
   const padL = 44;
@@ -16,25 +19,18 @@ const MixingChart: React.FC<MixingChartProps> = ({ history }) => {
   const plotW = width - padL - padR;
   const plotH = height - padT - padB;
 
-  const hasData = history.length > 1;
+  const hasData = history.length > 1 && history.at(-1)!.timeSec > history[0].timeSec;
   const maxKe = hasData
     ? Math.max(10, ...history.map((h) => h.kineticEnergyMjKg))
     : 50;
 
-  const mixPath = hasData
-    ? history
-        .map((pt, i) => {
-          const x = padL + (i / (history.length - 1)) * plotW;
-          const y = padT + plotH - (Math.min(100, Math.max(0, pt.mixingIndex)) / 100) * plotH;
-          return `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
-        })
-        .join(' ')
-    : '';
+  const startTime = history[0]?.timeSec ?? 0;
+  const duration = (history.at(-1)?.timeSec ?? startTime) - startTime;
 
   const kePath = hasData
     ? history
         .map((pt, i) => {
-          const x = padL + (i / (history.length - 1)) * plotW;
+          const x = padL + ((pt.timeSec - startTime) / duration) * plotW;
           const y = padT + plotH - (Math.min(maxKe, Math.max(0, pt.kineticEnergyMjKg)) / maxKe) * plotH;
           return `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${y.toFixed(1)}`;
         })
@@ -44,47 +40,36 @@ const MixingChart: React.FC<MixingChartProps> = ({ history }) => {
   const latest = hasData ? history[history.length - 1] : null;
 
   return (
-    <div className="bg-[#0F141D] border border-slate-800 rounded-lg p-4 flex flex-col gap-3">
+    <div className="lab-panel lab-chart">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <h3 className="text-sm font-semibold text-slate-100 inline-flex items-center gap-1.5">
-            Cinetica di Miscelazione &amp; Energia
+          <h3 className="inline-flex items-center gap-1.5">
+            {t.motionChart}
             <InfoTooltip
-              title="Come leggere Cinetica & Energia"
-              description="La linea verde M(%) misura nel tempo quanto il fluido si è mescolato (100% = uniforme). La linea ciano Ek mostra l’energia di movimento residua: nei fluidi densi crolla subito appena smetti di mescolare."
+              language={language}
+              title={t.energy}
+              description={t.energyHelp}
             />
           </h3>
-          <p className="text-xs text-slate-400">Omogeneità Danckwerts M(t) ed energia cinetica specifica</p>
+          <p className="text-xs text-slate-400">{t.energyDescription}</p>
         </div>
         <div className="flex items-center gap-4 text-[11px] font-mono">
-          <span className="text-emerald-400">― M (%)</span>
-          <span className="text-cyan-400">― Ek (mJ/kg)</span>
+          <span className="lab-chart-violet">― Ek (mJ/kg)</span>
         </div>
       </div>
 
-      <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto block">
+      <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-auto block" role="img" aria-label={t.energyDescription}>
         {[0, 0.5, 1].map((f) => {
           const y = padT + f * plotH;
-          const mixVal = Math.round((1 - f) * 100);
-          const keVal = ((1 - f) * maxKe).toFixed(0);
+          const keVal = formatReading(language, (1 - f) * maxKe, 0);
           return (
             <g key={f}>
-              <line x1={padL} y1={y} x2={padL + plotW} y2={y} stroke="#1e293b" strokeWidth="1" />
-              <text
-                x={padL - 6}
-                y={y + 3}
-                textAnchor="end"
-                fill="#34d399"
-                fontSize="9.5"
-                fontFamily="IBM Plex Mono, monospace"
-              >
-                {mixVal}%
-              </text>
+              <line x1={padL} y1={y} x2={padL + plotW} y2={y} stroke="var(--lab-chart-grid)" strokeWidth="1" />
               <text
                 x={padL + plotW + 6}
                 y={y + 3}
                 textAnchor="start"
-                fill="#06b6d4"
+                fill="var(--lab-chart-violet)"
                 fontSize="9.5"
                 fontFamily="IBM Plex Mono, monospace"
               >
@@ -96,8 +81,7 @@ const MixingChart: React.FC<MixingChartProps> = ({ history }) => {
 
         {hasData && (
           <>
-            <path d={kePath} fill="none" stroke="#06b6d4" strokeWidth="1.5" opacity="0.85" />
-            <path d={mixPath} fill="none" stroke="#34d399" strokeWidth="2" />
+            <path d={kePath} fill="none" stroke="var(--lab-chart-violet)" strokeWidth="1.5" opacity="0.85" />
           </>
         )}
 
@@ -105,17 +89,16 @@ const MixingChart: React.FC<MixingChartProps> = ({ history }) => {
           x={padL + plotW / 2}
           y={height - 6}
           textAnchor="middle"
-          fill="#64748b"
+          fill="var(--lab-muted)"
           fontSize="9.5"
-          fontFamily="IBM Plex Sans, sans-serif"
+          fontFamily="DM Sans, sans-serif"
         >
-          Finestra Temporale Campione (ultimi {history.length > 0 ? Math.round(history[history.length - 1].timeSec - history[0].timeSec) : 0} s)
+          {hasData ? t.sampleWindow + ' · ' + formatReading(language, duration, 1) + ' s' : t.noSamples}
         </text>
       </svg>
 
-      <div className="flex items-center justify-between pt-2 border-t border-slate-800/80 font-mono text-[11px] tabular-nums text-slate-300">
-        <span>Omogeneità: {latest ? latest.mixingIndex.toFixed(1) : '0.0'} %</span>
-        <span>Energia Ek: {latest ? latest.kineticEnergyMjKg.toFixed(2) : '0.00'} mJ/kg</span>
+      <div className="flex items-center justify-between pt-2 lab-chart-caption font-mono tabular-nums">
+        <span>{t.energy}: {formatReading(language, latest?.kineticEnergyMjKg ?? 0, 2)} mJ/kg</span>
       </div>
     </div>
   );

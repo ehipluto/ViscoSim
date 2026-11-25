@@ -52,14 +52,12 @@ export interface ScaleRange {
 
 export interface TimeSeriesPoint {
   timeSec: number;
-  mixingIndex: number;
   kineticEnergyMjKg: number;
 }
 
 export interface SimulationMetrics {
   elapsedSec: number;
   reynolds: number;
-  regime: 'Stokes / Creeping' | 'Laminare' | 'Transizione' | 'Turbolento';
   maxSpeedMs: number;
   meanShearRate: number;
   maxShearRate: number;
@@ -68,4 +66,5 @@ export interface SimulationMetrics {
   mixingIndex: number;
   kineticEnergyMjKg: number;
   scaleRange: ScaleRange;
+  stressSolveResidual: number;
 }

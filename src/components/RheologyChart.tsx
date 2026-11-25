@@ -2,8 +2,10 @@ import React, { useMemo, useState } from 'react';
 import { computeApparentViscosityPaS, computeShearStressPa } from '../constants/fluids';
 import { FluidConfig } from '../types/rheology';
 import InfoTooltip from './InfoTooltip';
+import { copy, formatReading, type Language } from '../locale';
 
 interface RheologyChartProps {
+  language: Language;
   config: FluidConfig;
   operatingShearRate: number;
 }
@@ -13,7 +15,8 @@ const SHEAR_SAMPLES = Array.from({ length: 41 }, (_, idx) => {
   return Math.pow(10, exp);
 });
 
-const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRate }) => {
+const RheologyChart: React.FC<RheologyChartProps> = ({ language, config, operatingShearRate }) => {
+  const t = copy[language];
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
   const width = 520;
@@ -78,7 +81,8 @@ const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRat
   }, [config, plotW, plotH]);
 
   const operatingPoint = useMemo(() => {
-    const clampedOpGamma = Math.max(0.1, Math.min(1000, operatingShearRate || 0.1));
+    if (operatingShearRate < 0.1 || operatingShearRate > 1000) return null;
+    const clampedOpGamma = operatingShearRate;
     const opTau = Math.max(1e-4, computeShearStressPa(clampedOpGamma, config));
     const opMu = Math.max(0.01, computeApparentViscosityPaS(clampedOpGamma, config) * 1000);
     return {
@@ -102,23 +106,24 @@ const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRat
   };
 
   return (
-    <div className="bg-[#0F141D] border border-slate-800 rounded-lg p-4 flex flex-col gap-3">
+    <div className="lab-panel lab-chart">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <h3 className="text-sm font-semibold text-slate-100 inline-flex items-center gap-1.5">
-            Curva di Flusso Reologica (Log-Log)
+          <h3 className="inline-flex items-center gap-1.5">
+            {t.rheologyChart}
             <InfoTooltip
-              title="Come leggere la Curva di Flusso"
-              description="Mostra come reagisce il fluido all’aumentare dell’agitazione (γ̇). La linea ciano indica la forza necessaria (τ), quella ambra tratteggiata la viscosità effettiva (μ). Il pallino ciano mostra lo stato attuale nella vasca."
+              language={language}
+              title={t.rheologyChart}
+              description={t.rheologyHelp}
             />
           </h3>
           <p className="text-xs text-slate-400">
-            Sforzo τ (Pa) e viscosità apparente μ (mPa·s) al variare del taglio γ̇
+            {t.rheologyDescription}
           </p>
         </div>
         <div className="flex items-center gap-4 text-[11px] font-mono">
-          <span className="text-cyan-400">― τ (Pa)</span>
-          <span className="text-amber-400">- - μ (mPa·s)</span>
+          <span className="lab-chart-violet">― τ (Pa)</span>
+          <span className="lab-chart-amber">- - μ (mPa·s)</span>
         </div>
       </div>
 
@@ -126,6 +131,8 @@ const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRat
         <svg
           viewBox={`0 0 ${width} ${height}`}
           className="w-full h-auto block select-none cursor-crosshair"
+          role="img"
+          aria-label={t.rheologyDescription}
           onPointerMove={handleSvgMove}
           onPointerLeave={() => setHoverIdx(null)}
         >
@@ -133,16 +140,16 @@ const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRat
             const x = curveData.mapX(g);
             return (
               <g key={g}>
-                <line x1={x} y1={padT} x2={x} y2={padT + plotH} stroke="#1e293b" strokeWidth="1" />
+                <line x1={x} y1={padT} x2={x} y2={padT + plotH} stroke="var(--lab-chart-grid)" strokeWidth="1" />
                 <text
                   x={x}
                   y={height - 10}
                   textAnchor="middle"
-                  fill="#94a3b8"
+                  fill="var(--lab-muted)"
                   fontSize="10"
                   fontFamily="IBM Plex Mono, monospace"
                 >
-                  {g}
+                  {formatReading(language, g, 1)}
                 </text>
               </g>
             );
@@ -156,12 +163,12 @@ const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRat
               curveData.maxLogMu - f * (curveData.maxLogMu - curveData.minLogMu);
             return (
               <g key={f}>
-                <line x1={padL} y1={y} x2={padL + plotW} y2={y} stroke="#1e293b" strokeWidth="1" />
+                <line x1={padL} y1={y} x2={padL + plotW} y2={y} stroke="var(--lab-chart-grid)" strokeWidth="1" />
                 <text
                   x={padL - 6}
                   y={y + 3}
                   textAnchor="end"
-                  fill="#06b6d4"
+                  fill="var(--lab-chart-violet)"
                   fontSize="9.5"
                   fontFamily="IBM Plex Mono, monospace"
                 >
@@ -171,7 +178,7 @@ const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRat
                   x={padL + plotW + 6}
                   y={y + 3}
                   textAnchor="start"
-                  fill="#f59e0b"
+                  fill="var(--lab-chart-amber)"
                   fontSize="9.5"
                   fontFamily="IBM Plex Mono, monospace"
                 >
@@ -181,10 +188,10 @@ const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRat
             );
           })}
 
-          <path d={curveData.muPath} fill="none" stroke="#f59e0b" strokeWidth="1.75" strokeDasharray="4 3" />
-          <path d={curveData.tauPath} fill="none" stroke="#06b6d4" strokeWidth="2.25" />
+          <path d={curveData.muPath} fill="none" stroke="var(--lab-chart-amber)" strokeWidth="1.75" strokeDasharray="4 3" />
+          <path d={curveData.tauPath} fill="none" stroke="var(--lab-chart-violet)" strokeWidth="2.25" />
 
-          <circle cx={curveData.opX} cy={curveData.opYTau} r="4.5" fill="#06b6d4" stroke="#07090e" strokeWidth="1.5" />
+          {operatingPoint && <circle cx={operatingPoint.opX} cy={operatingPoint.opYTau} r="4.5" fill="var(--lab-chart-violet)" stroke="var(--lab-panel)" strokeWidth="1.5" />}
 
           {activePoint && (
             <g>
@@ -193,7 +200,7 @@ const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRat
                 y1={padT}
                 x2={curveData.mapX(activePoint.gamma)}
                 y2={padT + plotH}
-                stroke="#64748b"
+                stroke="var(--lab-muted)"
                 strokeWidth="1"
                 strokeDasharray="2 2"
               />
@@ -201,13 +208,13 @@ const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRat
                 cx={curveData.mapX(activePoint.gamma)}
                 cy={curveData.mapYTau(activePoint.tau)}
                 r="4"
-                fill="#22d3ee"
+                fill="var(--lab-chart-violet)"
               />
               <circle
                 cx={curveData.mapX(activePoint.gamma)}
                 cy={curveData.mapYMu(activePoint.muMpas)}
                 r="4"
-                fill="#fbbf24"
+                fill="var(--lab-chart-amber)"
               />
             </g>
           )}
@@ -216,29 +223,29 @@ const RheologyChart: React.FC<RheologyChartProps> = ({ config, operatingShearRat
             x={padL + plotW / 2}
             y={height - 1}
             textAnchor="middle"
-            fill="#64748b"
+            fill="var(--lab-muted)"
             fontSize="9.5"
-            fontFamily="IBM Plex Sans, sans-serif"
+            fontFamily="DM Sans, sans-serif"
           >
-            Tasso di Taglio γ̇ (s⁻¹)
+            {t.shearRate} γ̇ (s⁻¹)
           </text>
         </svg>
       </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-800/80 font-mono text-[11px] tabular-nums text-slate-300">
+      <div className="flex flex-wrap items-center justify-between gap-2 pt-2 lab-chart-caption font-mono tabular-nums">
         {activePoint ? (
           <>
-            <span>Cursore γ̇: {activePoint.gamma.toFixed(2)} s⁻¹</span>
-            <span>τ: {activePoint.tau.toFixed(3)} Pa</span>
-            <span>μ: {activePoint.muMpas >= 100 ? Math.round(activePoint.muMpas).toLocaleString('it-IT') : activePoint.muMpas.toFixed(2)} mPa·s</span>
+            <span>{t.chartPointer} γ̇: {formatReading(language, activePoint.gamma, 2)} s⁻¹</span>
+            <span>τ: {formatReading(language, activePoint.tau, 3)} Pa</span>
+            <span>μ: {formatReading(language, activePoint.muMpas, 2)} mPa·s</span>
           </>
-        ) : (
+        ) : operatingPoint ? (
           <>
-            <span>Punto vasca γ̇̄: {curveData.clampedOpGamma.toFixed(2)} s⁻¹</span>
-            <span>τ̄: {curveData.opTau.toFixed(3)} Pa</span>
-            <span>μ_eff: {curveData.opMu >= 100 ? Math.round(curveData.opMu).toLocaleString('it-IT') : curveData.opMu.toFixed(2)} mPa·s</span>
+            <span>{t.meanShear}: {formatReading(language, operatingPoint.clampedOpGamma, 2)} s⁻¹</span>
+            <span>{t.stressAtMean}: {formatReading(language, operatingPoint.opTau, 3)} Pa</span>
+            <span>{t.viscosityAtMean}: {formatReading(language, operatingPoint.opMu, 2)} mPa·s</span>
           </>
-        )}
+        ) : <span>{t.shearOutside}</span>}
       </div>
     </div>
   );

@@ -1,12 +1,14 @@
 import React, { useEffect, useId, useRef, useState } from 'react';
 import { HelpCircle } from 'lucide-react';
+import type { Language } from '../locale';
 
 interface InfoTooltipProps {
+  language: Language;
   title: string;
   description: string;
 }
 
-const InfoTooltip: React.FC<InfoTooltipProps> = ({ title, description }) => {
+const InfoTooltip: React.FC<InfoTooltipProps> = ({ language, title, description }) => {
   const [open, setOpen] = useState(false);
   const [coords, setCoords] = useState<{ top: number; left: number; placeAbove: boolean }>({
     top: 0,
@@ -54,7 +56,7 @@ const InfoTooltip: React.FC<InfoTooltipProps> = ({ title, description }) => {
       <button
         ref={btnRef}
         type="button"
-        aria-label={`Informazioni: ${title}`}
+        aria-label={(language === 'it' ? 'Informazioni · ' : 'Information · ') + title}
         aria-describedby={open ? tooltipId : undefined}
         onMouseEnter={() => {
           updatePosition();

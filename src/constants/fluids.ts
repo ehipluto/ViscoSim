@@ -2,6 +2,7 @@ import { FluidConfig, FluidPreset } from '../types/rheology';
 
 export const MIN_LOG_VISCOSITY = 0.01;
 export const MAX_VISCOSITY_MPAS = 500000;
+export const MAX_NEWTONIAN_VISCOSITY_MPAS = 5000000;
 
 export const FLUID_PRESETS: FluidPreset[] = [
   {
@@ -176,11 +177,15 @@ export const DEFAULT_FLUID_CONFIG: FluidConfig = {
   color: '#06b6d4'
 };
 
-export function getEffectiveBaseViscosityMpas(viscosityMpas: number): number {
+export function getEffectiveBaseViscosityMpas(viscosityMpas: number, model: FluidConfig['model'] = 'newtonian'): number {
   if (!Number.isFinite(viscosityMpas) || viscosityMpas <= 0) {
     return MIN_LOG_VISCOSITY;
   }
-  return Math.min(MAX_VISCOSITY_MPAS, Math.max(MIN_LOG_VISCOSITY, viscosityMpas));
+  return Math.min(getViscosityInputLimit(model), Math.max(MIN_LOG_VISCOSITY, viscosityMpas));
+}
+
+export function getViscosityInputLimit(model: FluidConfig['model']): number {
+  return model === 'newtonian' ? MAX_NEWTONIAN_VISCOSITY_MPAS : MAX_VISCOSITY_MPAS;
 }
 
 export function getViscosityColorHex(viscosityMpas: number): string {
@@ -189,7 +194,7 @@ export function getViscosityColorHex(viscosityMpas: number): string {
     0,
     Math.min(
       1,
-      (Math.log10(eff) - Math.log10(0.5)) / (Math.log10(MAX_VISCOSITY_MPAS) - Math.log10(0.5))
+      (Math.log10(eff) - Math.log10(0.5)) / (Math.log10(MAX_NEWTONIAN_VISCOSITY_MPAS) - Math.log10(0.5))
     )
   );
 
@@ -218,14 +223,14 @@ export function getViscosityColorHex(viscosityMpas: number): string {
 }
 
 export function computeApparentViscosityPaS(shearRate: number, config: FluidConfig): number {
-  const kPaS = getEffectiveBaseViscosityMpas(config.viscosityMpas) / 1000;
+  const kPaS = getEffectiveBaseViscosityMpas(config.viscosityMpas, config.model) / 1000;
   if (config.model === 'newtonian') {
     return kPaS;
   }
 
-  const gamma = Math.max(0.05, shearRate);
+  const gamma = Math.max(0, shearRate);
   const n = config.flowIndex;
-  const powerTerm = kPaS * Math.pow(gamma, n - 1);
+  const powerTerm = kPaS * Math.pow(Math.max(0.05, gamma), n - 1);
 
   if (config.model === 'power-law') {
     return Math.min(1200, Math.max(1e-5, powerTerm));
@@ -233,16 +238,20 @@ export function computeApparentViscosityPaS(shearRate: number, config: FluidConf
 
   const tauY = Math.max(0, config.yieldStressPa);
   const m = Math.max(0.5, config.papanastasiouM);
-  const yieldTerm = (tauY * (1 - Math.exp(-m * gamma))) / gamma;
+  const yieldTerm = gamma === 0 ? tauY * m : (-tauY * Math.expm1(-m * gamma)) / gamma;
   return Math.min(1500, Math.max(1e-5, yieldTerm + powerTerm));
 }
 
 export function computeShearStressPa(shearRate: number, config: FluidConfig): number {
   const gamma = Math.max(0, shearRate);
   if (gamma === 0) {
-    return config.model === 'herschel-bulkley' ? Math.max(0, config.yieldStressPa) : 0;
+    return 0;
   }
   return computeApparentViscosityPaS(gamma, config) * gamma;
+}
+
+export function getRheologyInputUnit(model: FluidConfig['model']): string {
+  return model === 'newtonian' ? 'mPa·s' : 'mPa·sⁿ';
 }
 
 export function findNearestFluidPreset(viscosityMpas: number): FluidPreset {
@@ -252,6 +261,7 @@ export function findNearestFluidPreset(viscosityMpas: number): FluidPreset {
   let bestDiff = Infinity;
 
   for (let i = 0; i < FLUID_PRESETS.length; i++) {
+    if (FLUID_PRESETS[i].model !== 'newtonian') continue;
     const diff = Math.abs(Math.log10(FLUID_PRESETS[i].viscosityMpas) - targetLog);
     if (diff < bestDiff) {
       bestDiff = diff;

@@ -1,6 +1,9 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, ChevronUp, Download } from 'lucide-react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Activity, Box, ChartNoAxesCombined, Check, ChevronDown, Download, Droplet, Gauge, LibraryBig, Moon, Settings2, SlidersHorizontal, Sun, Waves, X } from 'lucide-react';
 import FluidViewport from './components/FluidViewport';
+import { copy, formatInput, formatReading, presetName, readPreference, savePreference, type Language } from './locale';
+import { GRID_N } from './simulation/cfdEngine';
+import { SIMULATION_STEP_SEC } from './simulation/simulationClock';
 import InfoTooltip from './components/InfoTooltip';
 import MixingChart from './components/MixingChart';
 import RheologyChart from './components/RheologyChart';
@@ -8,10 +11,10 @@ import {
   computeApparentViscosityPaS,
   computeShearStressPa,
   DEFAULT_FLUID_CONFIG,
-  findNearestFluidPreset,
   FLUID_PRESETS,
-  formatViscosityDisplay,
   getViscosityColorHex,
+  getRheologyInputUnit,
+  getViscosityInputLimit,
   MAX_VISCOSITY_MPAS,
   MIN_LOG_VISCOSITY,
 } from './constants/fluids';
@@ -26,52 +29,22 @@ import {
 
 type FluidBehaviorId = 'constant' | 'shear-thinning' | 'shear-thickening' | 'yield-plastic';
 
-const MODEL_LABELS: Record<RheologyModel, string> = {
-  newtonian: 'Newtoniano',
-  'power-law': 'Power-Law',
-  'herschel-bulkley': 'Herschel-Bulkley',
-};
+const MODEL_LABELS = { newtonian: 'newtonian', 'power-law': 'powerLaw', 'herschel-bulkley': 'herschelBulkley' } as const satisfies Record<RheologyModel, keyof typeof copy.en>;
+const BEHAVIOR_OPTIONS = [
+  { id: 'constant', label: 'constant', description: 'constantHelp' },
+  { id: 'shear-thinning', label: 'thinning', description: 'thinningHelp' },
+  { id: 'shear-thickening', label: 'thickening', description: 'thickeningHelp' },
+  { id: 'yield-plastic', label: 'yieldPlastic', description: 'yieldPlasticHelp' },
+] as const;
 
-const BEHAVIOR_OPTIONS: Array<{
-  id: FluidBehaviorId;
-  label: string;
-  hint: string;
-  techLabel: string;
-  description: string;
-}> = [
-  {
-    id: 'constant',
-    label: 'Costante',
-    hint: 'Acqua, oli, miele',
-    techLabel: 'Newtoniano (n = 1)',
-    description:
-      'La viscosità non cambia mai, sia che mescoli piano sia forte. Sceglilo per liquidi puri, solventi, oli e miele.',
-  },
-  {
-    id: 'shear-thinning',
-    label: 'Fluidifica agitando',
-    hint: 'Vernici, sangue, gel',
-    techLabel: 'Power-Law (n < 1)',
-    description:
-      'Da fermo è più denso, ma diventa subito più leggero e scorrevole mentre lo mescoli. Tipico di vernici, polimeri e gel.',
-  },
-  {
-    id: 'shear-thickening',
-    label: 'Addensa agitando',
-    hint: 'Amido, miscele dense',
-    techLabel: 'Power-Law (n > 1)',
-    description:
-      'Scorre bene se mosso piano, ma oppone una resistenza molto maggiore se mescoli con forza o velocità.',
-  },
-  {
-    id: 'yield-plastic',
-    label: 'Pasta con soglia',
-    hint: 'Ketchup, creme, stucco',
-    techLabel: 'Herschel-Bulkley (τy > 0)',
-    description:
-      'Da fermo resta compatto come un solido e scorre solo dove applichi abbastanza forza da superare la soglia τy.',
-  },
-];
+const PRESET_TILES = ([
+  { id: 'water', label: 'water' },
+  { id: 'olive-oil', label: 'oil' },
+  { id: 'honey', label: 'honey' },
+] as const).flatMap(({ id, label }) => {
+  const preset = FLUID_PRESETS.find((fluid) => fluid.id === id);
+  return preset ? [{ preset, label }] : [];
+});
 
 function getActiveBehavior(config: FluidConfig): FluidBehaviorId {
   if (config.model === 'newtonian') return 'constant';
@@ -79,43 +52,23 @@ function getActiveBehavior(config: FluidConfig): FluidBehaviorId {
   return config.flowIndex > 1 ? 'shear-thickening' : 'shear-thinning';
 }
 
-const QUICK_VISCOSITY_STOPS: Array<{ label: string; value: number }> = [
-  { label: '0', value: 0 },
-  { label: '1', value: 1 },
-  { label: '100', value: 100 },
-  { label: '1.4k', value: 1412 },
-  { label: '10k', value: 10000 },
-  { label: '50k', value: 50000 },
-  { label: '500k', value: 500000 },
-];
-
-const REGIME_STYLES: Record<
-  SimulationMetrics['regime'],
-  { glyph: string; className: string }
-> = {
-  'Stokes / Creeping': { glyph: '●', className: 'text-sky-400' },
-  Laminare: { glyph: '●', className: 'text-emerald-400' },
-  Transizione: { glyph: '▲', className: 'text-amber-400' },
-  Turbolento: { glyph: '■', className: 'text-rose-400' },
-};
-
 const INITIAL_METRICS: SimulationMetrics = {
   elapsedSec: 0,
   reynolds: 0,
-  regime: 'Laminare',
   maxSpeedMs: 0,
   meanShearRate: 0,
   maxShearRate: 0,
   maxShearStressPa: 0,
   effectiveViscosityMpas: DEFAULT_FLUID_CONFIG.viscosityMpas,
   mixingIndex: 0,
+  stressSolveResidual: 0,
   kineticEnergyMjKg: 0,
   scaleRange: {
     min: 0,
     mid: 50,
     max: 100,
     unit: '',
-    label: 'Moto del Fluido',
+    label: '',
   },
 };
 
@@ -194,17 +147,39 @@ const BufferedNumberInput: React.FC<BufferedNumberInputProps> = ({
 };
 
 export default function App() {
+  const [language, setLanguage] = useState<Language>(() => readPreference('viscosim-language') === 'it' ? 'it' : 'en');
+  const [darkMode, setDarkMode] = useState(() => readPreference('viscosim-theme') === 'dark');
+  const t = copy[language];
   const [config, setConfig] = useState<FluidConfig>(DEFAULT_FLUID_CONFIG);
   const [viscosityInput, setViscosityInput] = useState<string>(
-    String(DEFAULT_FLUID_CONFIG.viscosityMpas)
+    formatInput(language, DEFAULT_FLUID_CONFIG.viscosityMpas)
   );
+  const [inputError, setInputError] = useState(false);
+  const [chartsOpen, setChartsOpen] = useState(false);
   const [mode, setMode] = useState<VisualizationMode>('fluid');
   const [showVectors, setShowVectors] = useState<boolean>(false);
-  const [advancedOpen, setAdvancedOpen] = useState<boolean>(false);
+  const libraryRef = useRef<HTMLDialogElement>(null);
   const [metrics, setMetrics] = useState<SimulationMetrics>(INITIAL_METRICS);
   const [history, setHistory] = useState<TimeSeriesPoint[]>([]);
 
   const lastSampleTimeRef = useRef<number>(-1);
+
+  useEffect(() => {
+    document.documentElement.lang = language;
+    document.title = t.pageTitle;
+    document.querySelector('meta[name="description"]')?.setAttribute('content', t.pageDescription);
+    savePreference('viscosim-language', language);
+  }, [language, t]);
+
+  useLayoutEffect(() => {
+    document.documentElement.dataset.theme = darkMode ? 'dark' : 'light';
+    savePreference('viscosim-theme', darkMode ? 'dark' : 'light');
+  }, [darkMode]);
+
+  const changeLanguage = (nextLanguage: Language) => {
+    setLanguage(nextLanguage);
+    if (!inputError) setViscosityInput(formatInput(nextLanguage, config.viscosityMpas));
+  };
 
   const handleResetComplete = useCallback(() => {
     lastSampleTimeRef.current = -1;
@@ -219,7 +194,6 @@ export default function App() {
       setHistory((prev) => {
         const point: TimeSeriesPoint = {
           timeSec: next.elapsedSec,
-          mixingIndex: next.mixingIndex,
           kineticEnergyMjKg: next.kineticEnergyMjKg,
         };
         const updated = [...prev, point];
@@ -228,80 +202,58 @@ export default function App() {
     }
   }, []);
 
-  const nearestPreset = useMemo(
-    () => findNearestFluidPreset(config.viscosityMpas),
-    [config.viscosityMpas]
-  );
-
+  const viscosityLimit = getViscosityInputLimit(config.model);
   const sliderPos = useMemo(() => {
-    if (config.viscosityMpas <= 0) return 0;
     const minLog = Math.log10(MIN_LOG_VISCOSITY);
-    const maxLog = Math.log10(MAX_VISCOSITY_MPAS);
-    const clamped = Math.max(MIN_LOG_VISCOSITY, Math.min(MAX_VISCOSITY_MPAS, config.viscosityMpas));
+    const maxLog = Math.log10(viscosityLimit);
+    const clamped = Math.max(MIN_LOG_VISCOSITY, Math.min(viscosityLimit, config.viscosityMpas));
     return ((Math.log10(clamped) - minLog) / (maxLog - minLog)) * 100;
-  }, [config.viscosityMpas]);
+  }, [config.viscosityMpas, viscosityLimit]);
 
-  const applyCustomViscosity = (rawVal: number, textVal?: string) => {
+  const applyCustomViscosity = (rawVal: number) => {
     const clamped = Number.isFinite(rawVal)
-      ? Math.max(0, Math.min(MAX_VISCOSITY_MPAS, rawVal))
-      : 0;
-    if (textVal !== undefined) {
-      setViscosityInput(textVal);
-    } else {
-      setViscosityInput(
-        clamped === 0 ? '0' : clamped < 1 ? clamped.toFixed(2) : String(Math.round(clamped * 100) / 100)
-      );
-    }
+      ? Math.max(MIN_LOG_VISCOSITY, Math.min(viscosityLimit, rawVal))
+      : MIN_LOG_VISCOSITY;
+    setInputError(false);
+    setViscosityInput(formatInput(language, clamped));
     setConfig((prev) => ({
       ...prev,
       presetId: null,
-      name: 'Fluido Personalizzato',
+      name: 'Custom fluid',
       viscosityMpas: clamped,
       color: getViscosityColorHex(clamped),
     }));
   };
 
   const handleViscosityTextChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const raw = e.target.value;
-    setViscosityInput(raw);
-    if (raw === '' || raw === '.') return;
-    const parsed = parseFloat(raw);
-    if (Number.isFinite(parsed)) {
-      const clamped = Math.max(0, Math.min(MAX_VISCOSITY_MPAS, parsed));
-      setConfig((prev) => ({
-        ...prev,
-        presetId: null,
-        name: 'Fluido Personalizzato',
-        viscosityMpas: clamped,
-        color: getViscosityColorHex(clamped),
-      }));
-    }
+    setViscosityInput(e.target.value);
+    setInputError(false);
   };
 
   const handleViscosityBlur = () => {
-    const parsed = parseFloat(viscosityInput);
-    if (!Number.isFinite(parsed)) {
-      applyCustomViscosity(config.viscosityMpas);
-    } else {
-      applyCustomViscosity(parsed);
+    const raw = viscosityInput.trim();
+    const parsed = /^\d+(?:[.,]\d+)?$/.test(raw) ? Number(raw.replace(',', '.')) : NaN;
+    if (!Number.isFinite(parsed) || parsed < MIN_LOG_VISCOSITY || parsed > viscosityLimit) {
+      setInputError(true);
+      return;
     }
+    if (parsed !== config.viscosityMpas) applyCustomViscosity(parsed);
+    else setViscosityInput(formatInput(language, parsed));
+    setInputError(false);
   };
 
   const handleSliderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const pct = parseFloat(e.target.value);
-    if (pct <= 0.15) {
-      applyCustomViscosity(0, '0');
-      return;
-    }
     const minLog = Math.log10(MIN_LOG_VISCOSITY);
-    const maxLog = Math.log10(MAX_VISCOSITY_MPAS);
+    const maxLog = Math.log10(viscosityLimit);
     const val = Math.pow(10, minLog + (pct / 100) * (maxLog - minLog));
     const rounded = val < 1 ? Number(val.toFixed(2)) : val < 10 ? Number(val.toFixed(1)) : Math.round(val);
     applyCustomViscosity(rounded);
   };
 
   const applyPreset = (preset: FluidPreset) => {
-    setViscosityInput(String(preset.viscosityMpas));
+    setInputError(false);
+    setViscosityInput(formatInput(language, preset.viscosityMpas));
     setConfig((prev) => ({
       ...prev,
       presetId: preset.id,
@@ -317,13 +269,17 @@ export default function App() {
   };
 
   const handleBehaviorChange = (behavior: FluidBehaviorId) => {
-    setConfig((prev) => {
+    const parameter = behavior === 'constant' ? config.viscosityMpas : Math.min(config.viscosityMpas, MAX_VISCOSITY_MPAS);
+    setViscosityInput(formatInput(language, parameter));
+    setInputError(false);
+    setConfig((current) => {
+      const prev = { ...current, viscosityMpas: parameter };
       const customColor = prev.presetId ? getViscosityColorHex(prev.viscosityMpas) : prev.color;
       if (behavior === 'constant') {
         return {
           ...prev,
           presetId: null,
-          name: 'Fluido Personalizzato',
+          name: 'Custom fluid',
           model: 'newtonian',
           flowIndex: 1.0,
           yieldStressPa: 0,
@@ -334,7 +290,7 @@ export default function App() {
         return {
           ...prev,
           presetId: null,
-          name: 'Fluido Personalizzato',
+          name: 'Custom fluid',
           model: 'power-law',
           flowIndex: prev.flowIndex < 1 ? prev.flowIndex : 0.65,
           yieldStressPa: 0,
@@ -345,7 +301,7 @@ export default function App() {
         return {
           ...prev,
           presetId: null,
-          name: 'Fluido Personalizzato',
+          name: 'Custom fluid',
           model: 'power-law',
           flowIndex: prev.flowIndex > 1 ? prev.flowIndex : 1.38,
           yieldStressPa: 0,
@@ -356,7 +312,7 @@ export default function App() {
       return {
         ...prev,
         presetId: null,
-        name: 'Fluido Personalizzato',
+        name: 'Custom fluid',
         model: 'herschel-bulkley',
         flowIndex: prev.flowIndex === 1 || prev.flowIndex > 1 ? 0.45 : prev.flowIndex,
         yieldStressPa: prev.yieldStressPa > 0 ? prev.yieldStressPa : autoYield,
@@ -365,20 +321,29 @@ export default function App() {
     });
   };
 
+  const materialName = config.presetId ? presetName(language, config.presetId, config.name) : t.customFluid;
   const handleExportCsv = () => {
-    const lines: string[] = [
-      'ViscoSim CFD Report',
-      `Fluido,${config.name}`,
-      `Modello Reologico,${MODEL_LABELS[config.model]}`,
-      `Viscosita / Consistenza K (mPa*s),${config.viscosityMpas}`,
-      `Indice di Flusso n,${config.model === 'newtonian' ? 1 : config.flowIndex}`,
-      `Sforzo di Snervamento tau_y (Pa),${config.model === 'herschel-bulkley' ? config.yieldStressPa : 0}`,
-      `Densita (kg/m3),${config.densityKgM3}`,
-      `Diametro Vasca (mm),${config.tankDiameterMm}`,
-      `Diametro Asta (mm),${config.stirrerDiameterMm}`,
+    const row = (...cells: (string | number)[]) => cells.map((cell) => {
+      const text = String(cell);
+      return /[",\r\n]/.test(text) ? '"' + text.replaceAll('"', '""') + '"' : text;
+    }).join(',');
+    const lines = [
+      'ViscoSim CFD',
+      row(t.csvMethod, t.modelTag),
+      row(t.csvGrid, GRID_N + 'x' + GRID_N),
+      row(t.csvStep, SIMULATION_STEP_SEC),
+      row(t.fluid, materialName),
+      row(t.csvModel, t[MODEL_LABELS[config.model]]),
+      row(config.model === 'newtonian' ? t.csvViscosityInput : t.csvConsistencyInput, config.viscosityMpas),
+      row(t.flowIndex, config.model === 'newtonian' ? 1 : config.flowIndex),
+      row(t.yieldStress + ' (Pa)', config.model === 'herschel-bulkley' ? config.yieldStressPa : 0),
+      row(t.density + ' (kg/m3)', config.densityKgM3),
+      row(t.tankDiameter + ' (mm)', config.tankDiameterMm),
+      row(t.rodDiameter + ' (mm)', config.stirrerDiameterMm),
+      ...(config.model === 'newtonian' ? [] : [row(t.stressResidual, metrics.stressSolveResidual)]),
       '',
-      'Curva Reologica Teorica',
-      'Tasso di Taglio (1/s),Sforzo di Taglio (Pa),Viscosita Apparente (mPa*s)',
+      t.csvCurve,
+      row(t.shearRate + ' (1/s)', t.shear + ' (Pa)', t.csvViscosity),
     ];
 
     for (let i = 0; i <= 20; i++) {
@@ -389,10 +354,10 @@ export default function App() {
     }
 
     lines.push('');
-    lines.push('Serie Temporale Vasca');
-    lines.push('Tempo (s),Indice Miscelazione (%),Energia Cinetica (mJ/kg)');
+    lines.push(t.csvTimeSeries);
+    lines.push(row(t.csvTime, t.energy + ' (mJ/kg)'));
     history.forEach((pt) => {
-      lines.push(`${pt.timeSec.toFixed(2)},${pt.mixingIndex.toFixed(2)},${pt.kineticEnergyMjKg.toFixed(4)}`);
+      lines.push(`${pt.timeSec.toFixed(2)},${pt.kineticEnergyMjKg.toFixed(4)}`);
     });
 
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
@@ -406,576 +371,162 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  const regimeBadge = REGIME_STYLES[metrics.regime];
+  const parameterLabel = config.model === 'newtonian' ? t.viscosity : t.consistency;
+  const inputUnit = getRheologyInputUnit(config.model);
+
+
+  const updateFluid = (changes: Partial<FluidConfig>) => {
+    setConfig((prev) => ({ ...prev, presetId: null, name: 'Custom fluid', ...changes }));
+  };
+  const behavior = BEHAVIOR_OPTIONS.find(({ id }) => id === getActiveBehavior(config)) ?? BEHAVIOR_OPTIONS[0];
+  const metricValues = [
+    { label: t.peakSpeed, value: formatReading(language, metrics.maxSpeedMs, 3), unit: 'm/s', Icon: Gauge },
+    { label: t.meanShear, value: formatReading(language, metrics.meanShearRate, 2), unit: 's⁻¹', Icon: Activity },
+    { label: t.apparentViscosity, value: formatReading(language, metrics.effectiveViscosityMpas, 2), unit: 'mPa·s', Icon: Droplet },
+    { label: t.reynolds, value: formatReading(language, metrics.reynolds, 1), unit: '', Icon: Waves },
+    { label: t.peakShear, value: formatReading(language, metrics.maxShearRate, 2), unit: 's⁻¹', Icon: Activity },
+    { label: t.peakStress, value: formatReading(language, metrics.maxShearStressPa, 3), unit: 'Pa', Icon: Gauge },
+  ];
 
   return (
-    <div className="min-h-screen bg-[#07090E] text-slate-100 flex flex-col">
-      <header className="border-b border-slate-800 bg-[#07090E]/95 sticky top-0 z-30 backdrop-blur-sm">
-        <div className="max-w-[1440px] mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-4 sm:gap-8">
-          <a
-            href="#simulatore"
-            className="text-lg font-bold tracking-tight text-slate-100 whitespace-nowrap shrink-0"
-          >
-            ViscoSim
-          </a>
-
-          <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400">
-            <a
-              href="#simulatore"
-              className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0"
-            >
-              Simulatore
-            </a>
-            <a
-              href="#reologia"
-              className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0"
-            >
-              Curva Reologica
-            </a>
-            <a
-              href="#riferimenti"
-              className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0"
-            >
-              Riferimenti Fluidi
-            </a>
-          </nav>
-
-          <div className="flex items-center shrink-0">
-            <button
-              type="button"
-              onClick={handleExportCsv}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-slate-950 bg-cyan-400 hover:bg-cyan-300 rounded-md transition-colors whitespace-nowrap shrink-0 min-h-[38px]"
-            >
-              <Download size={14} />
-              Esporta CSV
+    <div className="lab-app">
+      <header className="lab-header">
+        <div className="lab-header-inner">
+          <h1 className="lab-brand">
+            <span className="lab-brand-mark" aria-hidden="true"><Waves size={21} strokeWidth={2.2} /></span>
+            <span>Visco<span className="lab-brand-accent">Sim</span></span>
+          </h1>
+          <span className="lab-model-tag"><Box size={16} aria-hidden="true" />{t.modelTag}</span>
+          <div className="lab-header-actions">
+            <label className="lab-language">
+              <span className="sr-only">{t.language}</span>
+              <select value={language} onChange={(event) => changeLanguage(event.target.value as Language)}>
+                <option value="en" lang="en">EN</option>
+                <option value="it" lang="it">IT</option>
+              </select>
+              <ChevronDown size={14} aria-hidden="true" />
+            </label>
+            <button type="button" className="lab-icon-button lab-theme-toggle" aria-label={darkMode ? t.lightTheme : t.darkTheme} title={darkMode ? t.lightTheme : t.darkTheme} onClick={() => setDarkMode(!darkMode)}>
+              {darkMode ? <Sun size={18} /> : <Moon size={18} />}
             </button>
+            <button type="button" className="lab-button lab-header-export" aria-label={t.exportCsv} onClick={handleExportCsv}><Download size={17} /><span>{t.exportCsv}</span></button>
           </div>
         </div>
       </header>
 
-      <main className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-6 py-6 space-y-8">
-        <section
-          id="simulatore"
-          className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start"
-        >
-          <aside className="lg:col-span-5 xl:col-span-4 space-y-4">
-            <div className="bg-[#0F141D] border border-slate-800 rounded-lg p-5 space-y-5">
-              <div className="flex items-baseline justify-between gap-2">
-                <h1 className="text-base font-semibold text-slate-100">
-                  Viscosità Dinamica / Consistenza
-                </h1>
-                <span className="inline-flex items-center gap-1.5 text-xs font-mono text-cyan-400 whitespace-nowrap">
-                  <span
-                    className="inline-block w-2.5 h-2.5 rounded-full border border-white/25 shrink-0"
-                    style={{ backgroundColor: config.color }}
-                    aria-hidden="true"
-                  />
-                  {config.presetId ? `Preset: ${config.name}` : 'Valore personalizzato'}
-                </span>
+      <main className="lab-main">
+        <section aria-label={t.workspace} className="lab-workbench">
+          <aside className="lab-sidebar">
+            <section className="lab-control lab-panel" aria-labelledby="fluid-heading">
+              <div className="lab-panel-heading">
+                <span className="lab-symbol"><SlidersHorizontal size={19} /></span>
+                <h2 id="fluid-heading">{t.fluid}</h2>
               </div>
 
-              <div>
-                <label htmlFor="viscosity-custom-input" className="sr-only">
-                  Inserisci viscosità personalizzata in mPa·s
-                </label>
-                <div className="relative flex items-center">
-                  <input
-                    id="viscosity-custom-input"
-                    type="number"
-                    min={0}
-                    max={MAX_VISCOSITY_MPAS}
-                    step="any"
-                    inputMode="decimal"
-                    value={viscosityInput}
-                    onChange={handleViscosityTextChange}
-                    onBlur={handleViscosityBlur}
-                    className="w-full bg-[#07090E] border border-slate-700 focus:border-cyan-400 focus:outline-none rounded-lg pl-4 pr-24 py-3 text-2xl sm:text-3xl font-mono font-semibold tabular-nums text-slate-100"
-                    placeholder="1.0"
-                  />
-                  <span className="absolute right-4 text-xs font-mono text-slate-400 pointer-events-none">
-                    mPa·s (cP)
-                  </span>
+              <div className="lab-material">
+                <span className="lab-material-dot" style={{ backgroundColor: config.color }} aria-hidden="true" />
+                <div><strong>{materialName}</strong><span>{t[MODEL_LABELS[config.model]]}</span></div>
+                <button type="button" className="lab-icon-button" title={t.openLibrary} aria-label={t.openLibrary} onClick={() => libraryRef.current?.showModal()}><LibraryBig size={19} /></button>
+              </div>
+
+              <div className="lab-viscosity">
+                <div className="lab-viscosity-label">
+                  <label htmlFor="viscosity-custom-input">{parameterLabel}</label>
+                  {config.model !== 'newtonian' && <InfoTooltip language={language} title={t.consistency} description={t.consistencyHelp} />}
                 </div>
-                {config.viscosityMpas === 0 && (
-                  <p className="mt-1.5 text-xs text-slate-400">
-                    Limite inferiore applicato al solutore: 0.01 mPa·s (regime quasi-inviscido).
-                  </p>
-                )}
-              </div>
-
-              <div className="space-y-2.5">
-                <input
-                  type="range"
-                  aria-label="Scala logaritmica viscosità"
-                  min={0}
-                  max={100}
-                  step={0.1}
-                  value={sliderPos}
-                  onChange={handleSliderChange}
-                  className="w-full lab-slider cursor-pointer"
-                />
-                <div className="flex justify-between text-[11px] font-mono text-slate-400 tabular-nums">
-                  <span>0</span>
-                  <span>1</span>
-                  <span>100</span>
-                  <span>10k</span>
-                  <span>500k</span>
+                <div className="lab-number-entry">
+                  <input id="viscosity-custom-input" type="text" inputMode="decimal" autoComplete="off" aria-invalid={Boolean(inputError)} aria-describedby={inputError ? 'viscosity-error' : undefined}
+                    value={viscosityInput} onChange={handleViscosityTextChange} onBlur={handleViscosityBlur}
+                    onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} />
+                  <span>{config.model === 'newtonian' ? 'mPa·s' : inputUnit}</span>
                 </div>
+                {inputError && <p id="viscosity-error" className="lab-field-error" role="alert">
+                  {t.viscosityRange.replace('{min}', formatReading(language, MIN_LOG_VISCOSITY, 2)).replace('{max}', formatReading(language, viscosityLimit, 0))}
+                </p>}
+                <input className="lab-range" aria-label={t.logScale + ' · ' + parameterLabel} aria-valuetext={formatReading(language, config.viscosityMpas, 3) + ' ' + inputUnit}
+                  type="range" min={0} max={100} step={0.1} value={sliderPos} onChange={handleSliderChange}
+                  style={{ '--fill': sliderPos + '%' } as React.CSSProperties} />
+                <div className="lab-range-labels" aria-hidden="true"><span>{formatReading(language, MIN_LOG_VISCOSITY, 2)}</span><span>{formatReading(language, viscosityLimit, 0)}</span></div>
+                {config.model === 'newtonian' && config.viscosityMpas > MAX_VISCOSITY_MPAS &&
+                  <p className="lab-field-hint">{t.highViscosityHint}</p>}
               </div>
 
-              <div className="grid grid-cols-7 gap-1">
-                {QUICK_VISCOSITY_STOPS.map((stop) => {
-                  const isMatch = Math.abs(config.viscosityMpas - stop.value) < 0.005;
-                  return (
-                    <button
-                      key={stop.label}
-                      type="button"
-                      onClick={() => applyCustomViscosity(stop.value)}
-                      className={`py-2 text-xs font-mono tabular-nums rounded border transition-colors min-h-[38px] ${
-                        isMatch
-                          ? 'bg-cyan-500/15 border-cyan-500/50 text-cyan-300'
-                          : 'bg-[#07090E] border-slate-800 text-slate-300 hover:border-slate-700'
-                      }`}
-                    >
-                      {stop.label}
+              <div className="lab-presets">
+                <div className="lab-presets-heading"><h3>{t.quickPresets}</h3><button type="button" className="lab-text-button" onClick={() => libraryRef.current?.showModal()}>{t.allFluids}</button></div>
+                <div className="lab-chips">
+                  {PRESET_TILES.map(({ preset, label }) => (
+                    <button type="button" key={preset.id} aria-pressed={preset.id === config.presetId} onClick={() => applyPreset(preset)}>
+                      <span style={{ backgroundColor: preset.color }} aria-hidden="true" />{t[label]}
                     </button>
-                  );
-                })}
-              </div>
-
-              <div className="pt-3 border-t border-slate-800/80 text-xs text-slate-400 flex items-center justify-between gap-2">
-                <span>Riferimento più vicino</span>
-                <span className="font-mono text-slate-200 tabular-nums truncate">
-                  {nearestPreset.name} · {formatViscosityDisplay(nearestPreset.viscosityMpas)} mPa·s
-                </span>
-              </div>
-            </div>
-
-            <div className="bg-[#0F141D] border border-slate-800 rounded-lg p-5 space-y-4">
-              <div className="space-y-2.5">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-1.5">
-                    <span className="block text-xs font-medium text-slate-300">
-                      Come si comporta il fluido?
-                    </span>
-                    <InfoTooltip
-                      title="Come scegliere il comportamento"
-                      description="Se scorre sempre uguale usa 'Costante'. Se agitando diventa più fluido (vernici, gel) usa 'Fluidifica agitando'. Se agitando si indurisce usa 'Addensa agitando'. Se da fermo resta come crema o pasta usa 'Pasta con soglia'."
-                    />
-                  </div>
-                  <span className="text-[11px] font-mono text-slate-400">
-                    {BEHAVIOR_OPTIONS.find((b) => b.id === getActiveBehavior(config))?.techLabel}
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-2 gap-1.5">
-                  {BEHAVIOR_OPTIONS.map((opt) => {
-                    const active = getActiveBehavior(config) === opt.id;
-                    return (
-                      <button
-                        key={opt.id}
-                        type="button"
-                        onClick={() => handleBehaviorChange(opt.id)}
-                        className={`px-3 py-2.5 text-left rounded-lg border transition-colors min-h-[54px] ${
-                          active
-                            ? 'bg-cyan-500/15 border-cyan-500/50 text-slate-100'
-                            : 'bg-[#07090E] border-slate-800 text-slate-300 hover:border-slate-700'
-                        }`}
-                      >
-                        <div className={`text-xs font-semibold ${active ? 'text-cyan-300' : 'text-slate-200'}`}>
-                          {opt.label}
-                        </div>
-                        <div className="text-[11px] text-slate-400 mt-0.5 truncate">
-                          {opt.hint}
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-
-                <p className="text-xs text-slate-400 leading-relaxed">
-                  {BEHAVIOR_OPTIONS.find((b) => b.id === getActiveBehavior(config))?.description}
-                </p>
-              </div>
-
-              <div className="space-y-2">
-                <label
-                  htmlFor="preset-fluid-select"
-                  className="block text-xs font-medium text-slate-300"
-                >
-                  Carica Fluido di Riferimento (Modificabile)
-                </label>
-                <select
-                  id="preset-fluid-select"
-                  value={config.presetId ?? 'custom'}
-                  onChange={(e) => {
-                    const found = FLUID_PRESETS.find((p) => p.id === e.target.value);
-                    if (found) applyPreset(found);
-                  }}
-                  className="w-full bg-[#07090E] border border-slate-700 focus:border-cyan-400 focus:outline-none rounded-lg px-3 py-2.5 text-sm text-slate-100 min-h-[42px]"
-                >
-                  <option value="custom">Personalizzato ({formatViscosityDisplay(config.viscosityMpas)} mPa·s)</option>
-                  {FLUID_PRESETS.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name} ({formatViscosityDisplay(p.viscosityMpas)} mPa·s)
-                    </option>
                   ))}
-                </select>
-                <p className="text-xs text-slate-400 leading-relaxed">
-                  {config.presetId
-                    ? nearestPreset.description
-                    : 'Configurazione personalizzata attiva. Modifica liberamente viscosità, indice n, snervamento o geometria.'}
-                </p>
+                </div>
               </div>
+            </section>
 
-              <div className="pt-2 border-t border-slate-800/80">
-                <button
-                  type="button"
-                  onClick={() => setAdvancedOpen((v) => !v)}
-                  aria-expanded={advancedOpen}
-                  className="w-full flex items-center justify-between py-2 text-xs font-semibold text-slate-200 hover:text-cyan-300 transition-colors min-h-[40px]"
-                >
-                  <span>Parametri Reologici e Geometria Vasca</span>
-                  {advancedOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-                </button>
-
-                {advancedOpen && (
-                  <div className="pt-3 space-y-4">
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label
-                          htmlFor="input-flow-index"
-                          className="flex items-center gap-1 text-[11px] text-slate-400 mb-1"
-                        >
-                          <span>Indice di flusso n</span>
-                          <InfoTooltip
-                            title="Indice di flusso (n)"
-                            description="Indica come cambia la viscosità mescolando: n = 1 costante (Newtoniano); n < 1 il fluido si fluidifica sotto sforzo (es. ketchup); n > 1 si addensa (es. amido)."
-                          />
-                        </label>
-                        <BufferedNumberInput
-                          id="input-flow-index"
-                          min={0.15}
-                          max={1.8}
-                          step={0.05}
-                          disabled={config.model === 'newtonian'}
-                          value={config.model === 'newtonian' ? 1 : config.flowIndex}
-                          onCommit={(val) =>
-                            setConfig((prev) => ({
-                              ...prev,
-                              presetId: null,
-                              name: 'Fluido Personalizzato',
-                              flowIndex: val,
-                              color: prev.presetId ? getViscosityColorHex(prev.viscosityMpas) : prev.color,
-                            }))
-                          }
-                          className="w-full bg-[#07090E] border border-slate-700 disabled:opacity-45 rounded px-3 py-2 text-sm font-mono tabular-nums text-slate-100"
-                        />
-                      </div>
-
-                      <div>
-                        <label
-                          htmlFor="input-yield-stress"
-                          className="flex items-center gap-1 text-[11px] text-slate-400 mb-1"
-                        >
-                          <span>Snervamento τy (Pa)</span>
-                          <InfoTooltip
-                            title="Sforzo di snervamento (τy)"
-                            description="È la spinta minima per rompere la struttura interna del fluido e farlo scorrere. Sotto questo valore (lontano dall’asta) il materiale resta immobile come un solido."
-                          />
-                        </label>
-                        <BufferedNumberInput
-                          id="input-yield-stress"
-                          min={0}
-                          max={500}
-                          step={1}
-                          disabled={config.model !== 'herschel-bulkley'}
-                          value={config.model === 'herschel-bulkley' ? config.yieldStressPa : 0}
-                          onCommit={(val) =>
-                            setConfig((prev) => ({
-                              ...prev,
-                              presetId: null,
-                              name: 'Fluido Personalizzato',
-                              yieldStressPa: val,
-                              color: prev.presetId ? getViscosityColorHex(prev.viscosityMpas) : prev.color,
-                            }))
-                          }
-                          className="w-full bg-[#07090E] border border-slate-700 disabled:opacity-45 rounded px-3 py-2 text-sm font-mono tabular-nums text-slate-100"
-                        />
-                      </div>
-
-                      <div>
-                        <label
-                          htmlFor="input-density"
-                          className="flex items-center gap-1 text-[11px] text-slate-400 mb-1"
-                        >
-                          <span>Densità ρ (kg/m³)</span>
-                          <InfoTooltip
-                            title="Densità (ρ)"
-                            description="Massa del fluido per unità di volume (acqua ≈ 1000). Più alta è la densità, maggiore è l’inerzia del liquido: i vortici persistono di più e sale il numero di Reynolds."
-                          />
-                        </label>
-                        <BufferedNumberInput
-                          id="input-density"
-                          min={500}
-                          max={2500}
-                          step={10}
-                          value={config.densityKgM3}
-                          onCommit={(val) =>
-                            setConfig((prev) => ({
-                              ...prev,
-                              presetId: null,
-                              name: 'Fluido Personalizzato',
-                              densityKgM3: val,
-                              color: prev.presetId ? getViscosityColorHex(prev.viscosityMpas) : prev.color,
-                            }))
-                          }
-                          className="w-full bg-[#07090E] border border-slate-700 rounded px-3 py-2 text-sm font-mono tabular-nums text-slate-100"
-                        />
-                      </div>
-
-                      <div>
-                        <label
-                          htmlFor="input-fluid-color"
-                          className="block text-[11px] text-slate-400 mb-1"
-                        >
-                          Colore Fluido
-                        </label>
-                        <input
-                          id="input-fluid-color"
-                          type="color"
-                          value={config.color}
-                          onChange={(e) =>
-                            setConfig((prev) => ({
-                              ...prev,
-                              presetId: null,
-                              name: 'Fluido Personalizzato',
-                              color: e.target.value,
-                            }))
-                          }
-                          className="w-full h-[38px] bg-[#07090E] border border-slate-700 rounded px-1 py-1 cursor-pointer"
-                        />
-                      </div>
-
-                      <div>
-                        <label
-                          htmlFor="input-tank-diameter"
-                          className="flex items-center gap-1 text-[11px] text-slate-400 mb-1"
-                        >
-                          <span>Diametro Vasca D</span>
-                          <InfoTooltip
-                            title="Diametro Vasca D (mm)"
-                            description="Larghezza interna del recipiente. Una vasca più grande aumenta la distanza dalle pareti, lasciando più spazio al flusso ma richiedendo più movimento per omogeneizzare i bordi."
-                          />
-                        </label>
-                        <BufferedNumberInput
-                          id="input-tank-diameter"
-                          min={50}
-                          max={600}
-                          step={10}
-                          value={config.tankDiameterMm}
-                          onCommit={(val) =>
-                            setConfig((prev) => ({ ...prev, tankDiameterMm: val }))
-                          }
-                          className="w-full bg-[#07090E] border border-slate-700 rounded px-3 py-2 text-sm font-mono tabular-nums text-slate-100"
-                        />
-                      </div>
-
-                      <div>
-                        <label
-                          htmlFor="input-stirrer-diameter"
-                          className="flex items-center gap-1 text-[11px] text-slate-400 mb-1"
-                        >
-                          <span>Diametro Asta d</span>
-                          <InfoTooltip
-                            title="Diametro Asta d (mm)"
-                            description="Spessore dell’agitatore manuale. Un’asta più larga sposta una massa maggiore di fluido ad ogni passata, allarga la scia e aumenta il numero di Reynolds."
-                          />
-                        </label>
-                        <BufferedNumberInput
-                          id="input-stirrer-diameter"
-                          min={6}
-                          max={80}
-                          step={2}
-                          value={config.stirrerDiameterMm}
-                          onCommit={(val) =>
-                            setConfig((prev) => ({ ...prev, stirrerDiameterMm: val }))
-                          }
-                          className="w-full bg-[#07090E] border border-slate-700 rounded px-3 py-2 text-sm font-mono tabular-nums text-slate-100"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                )}
+            <details className="lab-panel lab-settings">
+              <summary><span className="lab-symbol lab-symbol-neutral"><Settings2 size={18} /></span><span>{t.modelGeometry}</span><ChevronDown size={18} className="lab-chevron" /></summary>
+              <div className="lab-settings-body">
+                <label className="lab-field"><span>{t.fluidBehavior}</span>
+                  <select value={getActiveBehavior(config)} onChange={(event) => handleBehaviorChange(event.target.value as FluidBehaviorId)}>
+                    {BEHAVIOR_OPTIONS.map(({ id, label }) => <option key={id} value={id}>{t[label]}</option>)}
+                  </select>
+                </label>
+                <p className="lab-field-hint">{t[behavior.description]}</p>
+                <div className="lab-parameter-grid">
+                  <label className="lab-field"><span>{t.density} · kg/m³</span><BufferedNumberInput id="input-density" min={500} max={2500} step={10} value={config.densityKgM3} onCommit={(densityKgM3) => updateFluid({ densityKgM3 })} /></label>
+                  {config.model !== 'newtonian' && <label className="lab-field"><span>{t.flowIndex}</span><BufferedNumberInput id="input-flow-index" min={0.15} max={1.8} step={0.05} value={config.flowIndex} onCommit={(flowIndex) => updateFluid({ flowIndex })} /></label>}
+                  {config.model === 'herschel-bulkley' && <label className="lab-field"><span>{t.yieldStress} · Pa</span><BufferedNumberInput id="input-yield-stress" min={0} max={500} step={1} value={config.yieldStressPa} onCommit={(yieldStressPa) => updateFluid({ yieldStressPa })} /></label>}
+                  <label className="lab-field"><span>{t.tankDiameter} · mm</span><BufferedNumberInput id="input-tank-diameter" min={Math.max(50, config.stirrerDiameterMm + 1)} max={600} step={10} value={config.tankDiameterMm} onCommit={(tankDiameterMm) => setConfig((prev) => ({ ...prev, tankDiameterMm }))} /></label>
+                  <label className="lab-field"><span>{t.rodDiameter} · mm</span><BufferedNumberInput id="input-stirrer-diameter" min={6} max={Math.min(80, config.tankDiameterMm - 1)} step={2} value={config.stirrerDiameterMm} onCommit={(stirrerDiameterMm) => setConfig((prev) => ({ ...prev, stirrerDiameterMm }))} /></label>
+                  <label className="lab-field"><span>{t.fluidColor}</span><input id="input-fluid-color" type="color" value={config.color} onChange={(event) => setConfig((prev) => ({ ...prev, color: event.target.value }))} /></label>
+                </div>
               </div>
-            </div>
+            </details>
           </aside>
 
-          <div className="lg:col-span-7 xl:col-span-8 space-y-4">
-            <FluidViewport
-              config={config}
-              mode={mode}
-              onModeChange={setMode}
-              showVectors={showVectors}
-              onToggleVectors={() => setShowVectors((v) => !v)}
-              onMetricsUpdate={handleMetricsUpdate}
-              onResetComplete={handleResetComplete}
-            />
+          <FluidViewport config={config} language={language} mode={mode} onModeChange={setMode} showVectors={showVectors}
+            elapsedSec={metrics.elapsedSec} onToggleVectors={() => setShowVectors((value) => !value)} onMetricsUpdate={handleMetricsUpdate} onResetComplete={handleResetComplete} />
+        </section>
 
-            <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-3">
-              <div className="bg-[#0F141D] border border-slate-800 rounded-lg p-3.5">
-                <div className="text-[11px] text-slate-400 flex items-center justify-between gap-1">
-                  <span>Num. Reynolds</span>
-                  <InfoTooltip
-                    title="Numero di Reynolds (Re)"
-                    description="Rapporto tra inerzia del moto e attrito viscoso. Valori bassi indicano flusso ordinato e lento; valori alti (>2300) indicano transizione verso vortici e turbolenza."
-                  />
-                </div>
-                <div className="mt-1 font-mono text-lg font-semibold tabular-nums text-slate-100">
-                  {metrics.reynolds >= 100
-                    ? Math.round(metrics.reynolds).toLocaleString('it-IT')
-                    : metrics.reynolds.toFixed(2)}
-                </div>
-                <div className={`mt-1 text-[11px] font-medium ${regimeBadge.className}`}>
-                  {regimeBadge.glyph} {metrics.regime}
-                </div>
-              </div>
-
-              <div className="bg-[#0F141D] border border-slate-800 rounded-lg p-3.5">
-                <div className="text-[11px] text-slate-400 flex items-center justify-between gap-1">
-                  <span>Visc. Apparente Media</span>
-                  <InfoTooltip
-                    title="Viscosità Apparente Media"
-                    description="Resistenza effettiva media opposta dal fluido in vasca in questo istante. Nei fluidi non-Newtoniani varia in tempo reale mentre mescoli."
-                  />
-                </div>
-                <div className="mt-1 font-mono text-lg font-semibold tabular-nums text-slate-100">
-                  {formatViscosityDisplay(metrics.effectiveViscosityMpas)}
-                </div>
-                <div className="mt-1 text-[11px] font-mono text-slate-400">mPa·s</div>
-              </div>
-
-              <div className="bg-[#0F141D] border border-slate-800 rounded-lg p-3.5">
-                <div className="text-[11px] text-slate-400 flex items-center justify-between gap-1">
-                  <span>Velocità Picco</span>
-                  <InfoTooltip
-                    title="Velocità Picco (m/s)"
-                    description="Velocità lineare massima raggiunta dal fluido all’interno del recipiente nell’istante corrente."
-                  />
-                </div>
-                <div className="mt-1 font-mono text-lg font-semibold tabular-nums text-cyan-400">
-                  {metrics.maxSpeedMs.toFixed(2)}
-                </div>
-                <div className="mt-1 text-[11px] font-mono text-slate-400">m/s</div>
-              </div>
-
-              <div className="bg-[#0F141D] border border-slate-800 rounded-lg p-3.5">
-                <div className="text-[11px] text-slate-400 flex items-center justify-between gap-1">
-                  <span>Taglio Picco γ̇</span>
-                  <InfoTooltip
-                    title="Tasso di Taglio Picco (γ̇)"
-                    description="Intensità massima con cui gli strati adiacenti di fluido scorrono l’uno sull’altro attorno all’asta (in s⁻¹)."
-                  />
-                </div>
-                <div className="mt-1 font-mono text-lg font-semibold tabular-nums text-slate-100">
-                  {metrics.maxShearRate.toFixed(1)}
-                </div>
-                <div className="mt-1 text-[11px] font-mono text-slate-400">s⁻¹</div>
-              </div>
-
-              <div className="bg-[#0F141D] border border-slate-800 rounded-lg p-3.5">
-                <div className="text-[11px] text-slate-400 flex items-center justify-between gap-1">
-                  <span>Sforzo Picco τ</span>
-                  <InfoTooltip
-                    title="Sforzo di Taglio Picco (τ)"
-                    description="Pressione tangenziale massima (in Pascal) necessaria per deformare e trascinare il fluido vicino all’agitatore."
-                  />
-                </div>
-                <div className="mt-1 font-mono text-lg font-semibold tabular-nums text-amber-400">
-                  {metrics.maxShearStressPa >= 100
-                    ? Math.round(metrics.maxShearStressPa).toLocaleString('it-IT')
-                    : metrics.maxShearStressPa.toFixed(2)}
-                </div>
-                <div className="mt-1 text-[11px] font-mono text-slate-400">Pa</div>
-              </div>
-
-              <div className="bg-[#0F141D] border border-slate-800 rounded-lg p-3.5">
-                <div className="text-[11px] text-slate-400 flex items-center justify-between gap-1">
-                  <span>Omogeneità M(t)</span>
-                  <InfoTooltip
-                    title="Indice di Omogeneità M(t)"
-                    description="Misura quanto il fluido si è mescolato nello spazio (indice di Danckwerts): 0% indica fluido fermo non mescolato, 100% indica miscelazione completa."
-                  />
-                </div>
-                <div className="mt-1 font-mono text-lg font-semibold tabular-nums text-emerald-400">
-                  {metrics.mixingIndex.toFixed(1)}
-                </div>
-                <div className="mt-1 text-[11px] font-mono text-slate-400">% Danckwerts</div>
-              </div>
+        <section className="lab-readouts" aria-label={t.readings}>
+          {metricValues.map(({ label, value, unit, Icon }) => (
+            <div key={label} className="lab-readout lab-panel">
+              <span className="lab-symbol lab-symbol-neutral"><Icon size={19} /></span>
+              <dl><dt>{label}</dt><dd>{value} {unit && <span>{unit}</span>}</dd></dl>
             </div>
-          </div>
+          ))}
         </section>
 
-        <section id="reologia" className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <RheologyChart config={config} operatingShearRate={metrics.meanShearRate} />
-          <MixingChart history={history} />
-        </section>
+        {metrics.stressSolveResidual > 0.01 &&
+          <p className="lab-field-error" role="status">
+            {t.stressResidualWarning} ({formatReading(language, 100 * metrics.stressSolveResidual, 1)}%)
+          </p>}
 
-        <section id="riferimenti" className="bg-[#0F141D] border border-slate-800 rounded-lg p-5 space-y-4">
-          <div className="flex flex-wrap items-baseline justify-between gap-2">
-            <div>
-              <h2 className="text-base font-semibold text-slate-100">
-                Tabella Comparativa Fluidi Industriali
-              </h2>
-              <p className="text-xs text-slate-400">
-                Seleziona una riga per caricare i parametri reologici calibrati come punto di partenza modificabile.
-              </p>
-            </div>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="border-b border-slate-800 text-slate-400">
-                  <th className="py-2.5 pr-4 font-medium">Fluido</th>
-                  <th className="py-2.5 px-3 font-medium">Classe Reologica</th>
-                  <th className="py-2.5 px-3 font-medium text-right">K / μ (mPa·s)</th>
-                  <th className="py-2.5 px-3 font-medium text-right">Indice n</th>
-                  <th className="py-2.5 px-3 font-medium text-right">τy (Pa)</th>
-                  <th className="py-2.5 pl-3 font-medium text-right">ρ (kg/m³)</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums">
-                {FLUID_PRESETS.map((preset) => {
-                  const selected = config.presetId === preset.id;
-                  return (
-                    <tr
-                      key={preset.id}
-                      onClick={() => applyPreset(preset)}
-                      className={`cursor-pointer transition-colors ${
-                        selected ? 'bg-cyan-500/10 text-cyan-200' : 'hover:bg-slate-800/40 text-slate-200'
-                      }`}
-                    >
-                      <td className="py-2.5 pr-4 font-sans font-medium whitespace-nowrap">
-                        {preset.name}
-                      </td>
-                      <td className="py-2.5 px-3 font-sans text-slate-400 whitespace-nowrap">
-                        {MODEL_LABELS[preset.model]} · {preset.category}
-                      </td>
-                      <td className="py-2.5 px-3 text-right">
-                        {formatViscosityDisplay(preset.viscosityMpas)}
-                      </td>
-                      <td className="py-2.5 px-3 text-right">{preset.flowIndex.toFixed(2)}</td>
-                      <td className="py-2.5 px-3 text-right">{preset.yieldStressPa}</td>
-                      <td className="py-2.5 pl-3 text-right">{preset.densityKgM3}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </section>
+        <details className="lab-panel lab-settings lab-chart-details" onToggle={(event) => setChartsOpen(event.currentTarget.open)}>
+          <summary><span className="lab-symbol lab-symbol-neutral"><ChartNoAxesCombined size={18} /></span><span>{t.charts}</span><ChevronDown size={18} className="lab-chevron" /></summary>
+          {chartsOpen && <div className="lab-charts">
+            <RheologyChart language={language} config={config} operatingShearRate={metrics.meanShearRate} />
+            <MixingChart language={language} history={history} />
+          </div>}
+        </details>
+        <p className="lab-mobile-method"><Box size={15} aria-hidden="true" />{t.modelTag}</p>
       </main>
+
+      <dialog className="lab-library" ref={libraryRef} aria-labelledby="library-heading" onClick={(event) => { if (event.target === event.currentTarget) event.currentTarget.close(); }}>
+        <div className="lab-library-content">
+          <header><div><h2 id="library-heading">{t.fluidLibrary}</h2><p>{t.libraryDescription}</p></div>
+            <button type="button" className="lab-icon-button" onClick={() => libraryRef.current?.close()} aria-label={t.closeLibrary}><X size={21} /></button></header>
+          <div className="lab-library-grid">
+            {FLUID_PRESETS.map((preset) => (
+              <button type="button" key={preset.id} aria-pressed={preset.id === config.presetId} className="lab-library-card" onClick={() => { applyPreset(preset); libraryRef.current?.close(); }}>
+                <span className="lab-material-dot" style={{ backgroundColor: preset.color }} aria-hidden="true" />
+                <div><strong>{presetName(language, preset.id, preset.name)}</strong><span>{t[MODEL_LABELS[preset.model]]} · {formatReading(language, preset.viscosityMpas, 3)} {getRheologyInputUnit(preset.model)}</span></div>
+                {preset.id === config.presetId && <Check size={17} aria-label={t.selected} />}
+              </button>
+            ))}
+          </div>
+        </div>
+      </dialog>
     </div>
   );
 }

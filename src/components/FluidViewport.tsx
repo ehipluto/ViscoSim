@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Compass, RotateCcw } from 'lucide-react';
+import { Compass, Crosshair, Lock, LockOpen, MousePointer2, Orbit, Pause, Play, RotateCcw } from 'lucide-react';
 import { CFDEngine } from '../simulation/cfdEngine';
+import { computeApparentViscosityPaS } from '../constants/fluids';
+import { PointerPath, SIMULATION_STEP_SEC, SimulationClock } from '../simulation/simulationClock';
 import {
   FluidConfig,
   ProbeSample,
@@ -9,9 +11,12 @@ import {
   VisualizationMode,
 } from '../types/rheology';
 import InfoTooltip from './InfoTooltip';
+import { copy, formatReading, type Language } from '../locale';
 
 interface FluidViewportProps {
   config: FluidConfig;
+  language: Language;
+  elapsedSec: number;
   mode: VisualizationMode;
   onModeChange: (mode: VisualizationMode) => void;
   showVectors: boolean;
@@ -20,35 +25,8 @@ interface FluidViewportProps {
   onResetComplete?: () => void;
 }
 
-const MODE_OPTIONS: Array<{
-  id: VisualizationMode;
-  label: string;
-  helpTitle?: string;
-  helpText?: string;
-}> = [
-  { id: 'fluid', label: 'Fluido Reale' },
-  {
-    id: 'velocity',
-    label: 'Velocità',
-    helpTitle: 'Mappa della Velocità |u|',
-    helpText:
-      'Mostra quanto velocemente si muove il fluido in ogni punto (in m/s). Il blu scuro indica zone ferme; ciano, verde e giallo indicano flusso rapido.',
-  },
-  {
-    id: 'vorticity',
-    label: 'Vorticità',
-    helpTitle: 'Mappa della Vorticità ω',
-    helpText:
-      'Evidenzia i vortici e la rotazione locale del fluido (in s⁻¹): blu per rotazione oraria, rosso/ambra per rotazione antioraria, scuro per flusso rettilineo.',
-  },
-  {
-    id: 'shear',
-    label: 'Sforzo Taglio',
-    helpTitle: 'Mappa dello Sforzo di Taglio τ',
-    helpText:
-      'Visualizza la forza meccanica interna applicata al fluido (in Pa). Nei fluidi pastosi rivela la "caverna" fluida attorno all’asta rispetto alle zone esterne immobili.',
-  },
-];
+const MODES: VisualizationMode[] = ['fluid', 'velocity', 'vorticity', 'shear'];
+const MAP_HELP = { velocity: 'speedHelp', vorticity: 'vorticityHelp', shear: 'shearHelp' } as const;
 
 function getLegendGradient(mode: VisualizationMode): string {
   if (mode === 'velocity') {
@@ -60,17 +38,15 @@ function getLegendGradient(mode: VisualizationMode): string {
   return 'linear-gradient(90deg, #0b0e17 0%, #581c87 25%, #dc2626 55%, #f59e0b 80%, #fef9c3 100%)';
 }
 
-function formatScaleNum(val: number): string {
+function formatScaleNum(language: Language, val: number): string {
   const abs = Math.abs(val);
-  if (abs === 0) return '0';
-  if (abs < 0.1) return val.toFixed(3);
-  if (abs < 10) return val.toFixed(2);
-  if (abs < 100) return val.toFixed(1);
-  return Math.round(val).toLocaleString('it-IT');
+  return formatReading(language, val, abs < 0.1 ? 3 : abs < 10 ? 2 : abs < 100 ? 1 : 0);
 }
 
 const FluidViewport: React.FC<FluidViewportProps> = ({
   config,
+  language,
+  elapsedSec,
   mode,
   onModeChange,
   showVectors,
@@ -78,37 +54,49 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
   onMetricsUpdate,
   onResetComplete,
 }) => {
+  const t = copy[language];
   const containerRef = useRef<HTMLDivElement>(null);
   const fluidCanvasRef = useRef<HTMLCanvasElement>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
-  const engineRef = useRef<CFDEngine | null>(null);
   const sizeRef = useRef<number>(512);
 
   const configRef = useRef(config);
   const modeRef = useRef(mode);
   const vectorsRef = useRef(showVectors);
   const metricsCallbackRef = useRef(onMetricsUpdate);
+  const resetCallbackRef = useRef(onResetComplete);
+  const resetRequested = useRef(false);
+  const pausedRef = useRef(false);
+  const [paused, setPaused] = useState(false);
+  const [lockedMode, setLockedMode] = useState<VisualizationMode | null>(null);
+  const scaleLockedRef = useRef(false);
+  const pointerPath = useRef(new PointerPath());
 
   configRef.current = config;
   modeRef.current = mode;
   vectorsRef.current = showVectors;
   metricsCallbackRef.current = onMetricsUpdate;
+  resetCallbackRef.current = onResetComplete;
+  scaleLockedRef.current = lockedMode === mode;
+
+  const physicsKey = [
+    config.model, config.viscosityMpas, config.flowIndex, config.yieldStressPa,
+    config.papanastasiouM, config.densityKgM3, config.tankDiameterMm, config.stirrerDiameterMm,
+  ].join('/');
+  const physicsKeyRef = useRef(physicsKey);
+  physicsKeyRef.current = physicsKey;
 
   const pointerRef = useRef<{
     active: boolean;
     hovering: boolean;
     xNorm: number;
     yNorm: number;
-    prevXNorm: number;
-    prevYNorm: number;
     pointerId: number | null;
   }>({
     active: false,
     hovering: false,
     xNorm: 0.5,
     yNorm: 0.5,
-    prevXNorm: 0.5,
-    prevYNorm: 0.5,
     pointerId: null,
   });
 
@@ -118,7 +106,7 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
     mid: 50,
     max: 100,
     unit: '',
-    label: 'Moto del Fluido',
+    label: '',
   });
 
   useEffect(() => {
@@ -129,7 +117,7 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
 
     const engine = new CFDEngine();
     engine.initRenderer(fluidCanvas);
-    engineRef.current = engine;
+    engine.reset(computeApparentViscosityPaS(0, configRef.current));
 
     const overlayCtx = overlayCanvas.getContext('2d');
     if (!overlayCtx) return;
@@ -150,93 +138,140 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
     observer.observe(container);
 
     let rafId = 0;
-    let lastFrameTime = performance.now();
+    const clock = new SimulationClock(performance.now());
+    let lastPhysicsKey = physicsKeyRef.current;
     let lastUiSyncTime = 0;
+    let lastRenderKey = '';
+    let range = engine.getActiveScaleRange('fluid');
+    let metricsDirty = true;
+    let lastUiMode = modeRef.current;
+    let lastUiPaused = pausedRef.current;
+    let lastUiLock = scaleLockedRef.current;
+    let activity = false;
+    const syncVisibility = () => {
+      clock.reset(performance.now());
+      pointerRef.current.active = false;
+      pointerRef.current.pointerId = null;
+      pointerPath.current.clear();
+    };
+    document.addEventListener('visibilitychange', syncVisibility);
 
     const renderFrame = (now: number) => {
-      const dt = Math.min(0.033, Math.max(0.004, (now - lastFrameTime) * 0.001));
-      lastFrameTime = now;
-
+      rafId = requestAnimationFrame(renderFrame);
+      if (document.hidden) return;
       const cfg = configRef.current;
       const ptr = pointerRef.current;
-      if (ptr.active) {
-        engine.applyStirrerImpulse(
-          ptr.prevXNorm,
-          ptr.prevYNorm,
-          ptr.xNorm,
-          ptr.yNorm,
-          dt,
-          cfg
-        );
-        ptr.prevXNorm = ptr.xNorm;
-        ptr.prevYNorm = ptr.yNorm;
+      let fieldsChanged = false;
+      if (resetRequested.current || physicsKeyRef.current !== lastPhysicsKey) {
+        if (physicsKeyRef.current !== lastPhysicsKey) {
+          pointerPath.current.clear();
+          pointerRef.current.active = false;
+          pointerRef.current.pointerId = null;
+        }
+        resetRequested.current = false;
+        lastPhysicsKey = physicsKeyRef.current;
+        engine.reset(computeApparentViscosityPaS(0, cfg), scaleLockedRef.current);
+        fieldsChanged = true;
+        activity = false;
+        clock.reset(now);
+        resetCallbackRef.current?.();
       }
 
-      engine.step(dt, cfg);
+      if (pausedRef.current || (!activity && !pointerPath.current.hasPendingInput)) {
+        clock.reset(now);
+      } else {
+        clock.advance(now, (timeMs) => {
+          const segment = pointerPath.current.sample(timeMs);
+          if (segment) engine.applyStirrerImpulse(...segment, SIMULATION_STEP_SEC, cfg);
+          engine.step(SIMULATION_STEP_SEC, cfg);
+          activity = true;
+          fieldsChanged = true;
+        });
+      }
 
       const sz = sizeRef.current;
-      const range = engine.renderFluidLayer(
-        fluidCanvas,
-        sz,
-        sz,
-        modeRef.current,
-        cfg.color
-      );
-
-      overlayCtx.clearRect(0, 0, sz, sz);
-      const cx = sz * 0.5;
-      const cy = sz * 0.5;
-      const radiusPx = sz * 0.45;
-
-      if (vectorsRef.current) {
-        overlayCtx.save();
-        overlayCtx.beginPath();
-        overlayCtx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
-        overlayCtx.clip();
-        engine.drawVectorOverlay(overlayCtx, sz, sz);
-        overlayCtx.restore();
-      }
-
-      overlayCtx.strokeStyle = '#334155';
-      overlayCtx.lineWidth = Math.max(1.5, sz * 0.0035);
-      overlayCtx.beginPath();
-      overlayCtx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
-      overlayCtx.stroke();
-
-      overlayCtx.strokeStyle = 'rgba(148, 163, 184, 0.35)';
-      overlayCtx.lineWidth = 1;
-      for (let a = 0; a < 12; a++) {
-        const ang = (a * Math.PI) / 6;
-        const rIn = radiusPx + 2;
-        const rOut = radiusPx + (a % 3 === 0 ? 9 : 5);
-        overlayCtx.beginPath();
-        overlayCtx.moveTo(cx + Math.cos(ang) * rIn, cy + Math.sin(ang) * rIn);
-        overlayCtx.lineTo(cx + Math.cos(ang) * rOut, cy + Math.sin(ang) * rOut);
-        overlayCtx.stroke();
-      }
-
-      if (ptr.hovering || ptr.active) {
-        const sx = ptr.xNorm * sz;
-        const sy = ptr.yNorm * sz;
-        const rodRadiusPx = Math.max(
-          5,
-          ((cfg.stirrerDiameterMm * 0.5) / Math.max(50, cfg.tankDiameterMm)) * (radiusPx * 2)
+      const renderKey = [
+        sz, modeRef.current, vectorsRef.current, cfg.color, scaleLockedRef.current,
+        ptr.active, ptr.hovering, ptr.xNorm, ptr.yNorm,
+      ].join('/');
+      const needsPaint = fieldsChanged || renderKey !== lastRenderKey;
+      if (needsPaint) {
+        lastRenderKey = renderKey;
+        range = engine.renderFluidLayer(
+          fluidCanvas,
+          sz,
+          sz,
+          modeRef.current,
+          cfg.color,
+          scaleLockedRef.current,
         );
 
-        overlayCtx.strokeStyle = ptr.active ? '#06b6d4' : 'rgba(226, 232, 240, 0.55)';
-        overlayCtx.lineWidth = ptr.active ? 2 : 1.25;
+        overlayCtx.clearRect(0, 0, sz, sz);
+        const cx = sz * 0.5;
+        const cy = sz * 0.5;
+        const radiusPx = sz * 0.45;
+
+        if (vectorsRef.current) {
+          overlayCtx.save();
+          overlayCtx.beginPath();
+          overlayCtx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
+          overlayCtx.clip();
+          engine.drawVectorOverlay(overlayCtx, sz, sz);
+          overlayCtx.restore();
+        }
+
+        overlayCtx.strokeStyle = 'rgba(190, 211, 255, .72)';
+        overlayCtx.lineWidth = Math.max(1, sz * 0.002);
         overlayCtx.beginPath();
-        overlayCtx.arc(sx, sy, rodRadiusPx, 0, Math.PI * 2);
+        overlayCtx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
         overlayCtx.stroke();
 
-        if (ptr.active) {
-          overlayCtx.fillStyle = 'rgba(6, 182, 212, 0.18)';
-          overlayCtx.fill();
+        overlayCtx.strokeStyle = 'rgba(148, 163, 184, 0.35)';
+        overlayCtx.lineWidth = 1;
+        for (let a = 0; a < 12; a++) {
+          const ang = (a * Math.PI) / 6;
+          const rIn = radiusPx + 2;
+          const rOut = radiusPx + (a % 3 === 0 ? 9 : 5);
+          overlayCtx.beginPath();
+          overlayCtx.moveTo(cx + Math.cos(ang) * rIn, cy + Math.sin(ang) * rIn);
+          overlayCtx.lineTo(cx + Math.cos(ang) * rOut, cy + Math.sin(ang) * rOut);
+          overlayCtx.stroke();
+        }
+
+        if (ptr.active || ptr.hovering) {
+          const sx = ptr.xNorm * sz;
+          const sy = ptr.yNorm * sz;
+          const rodRadiusPx = Math.max(
+            5,
+            ((cfg.stirrerDiameterMm * 0.5) / Math.max(50, cfg.tankDiameterMm)) * (radiusPx * 2)
+          );
+
+          const stirring = ptr.active;
+          overlayCtx.strokeStyle = stirring ? '#e5e3ff' : 'rgba(226, 232, 240, 0.62)';
+          overlayCtx.lineWidth = stirring ? 2 : 1.25;
+          overlayCtx.beginPath();
+          overlayCtx.arc(sx, sy, rodRadiusPx, 0, Math.PI * 2);
+          overlayCtx.stroke();
+
+          if (stirring) {
+            overlayCtx.fillStyle = 'rgba(194, 160, 255, .3)';
+            overlayCtx.fill();
+            overlayCtx.beginPath();
+            overlayCtx.arc(sx, sy, Math.max(1.5, sz * 0.004), 0, Math.PI * 2);
+            overlayCtx.fillStyle = '#f0ebff';
+            overlayCtx.fill();
+          }
         }
       }
-
-      if (now - lastUiSyncTime >= 100) {
+      metricsDirty ||= needsPaint;
+      const controlsChanged = lastUiMode !== modeRef.current || lastUiPaused !== pausedRef.current ||
+        lastUiLock !== scaleLockedRef.current;
+      if ((metricsDirty && now - lastUiSyncTime >= 100) || controlsChanged) {
+        metricsDirty = false;
         lastUiSyncTime = now;
+        lastUiMode = modeRef.current;
+        lastUiPaused = pausedRef.current;
+        lastUiLock = scaleLockedRef.current;
         setScaleRange(range);
         metricsCallbackRef.current(engine.getMetrics(cfg, range));
         if (ptr.hovering || ptr.active) {
@@ -245,8 +280,6 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
           setProbe(null);
         }
       }
-
-      rafId = requestAnimationFrame(renderFrame);
     };
 
     rafId = requestAnimationFrame(renderFrame);
@@ -254,8 +287,8 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
     return () => {
       cancelAnimationFrame(rafId);
       observer.disconnect();
+      document.removeEventListener('visibilitychange', syncVisibility);
       engine.dispose();
-      engineRef.current = null;
     };
   }, []);
 
@@ -269,15 +302,15 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
   };
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (pausedRef.current || pointerRef.current.active || e.button !== 0) return;
     e.currentTarget.setPointerCapture(e.pointerId);
     const [x, y] = toNormCoords(e.clientX, e.clientY);
+    pointerPath.current.push({ timeMs: e.timeStamp, x, y, kind: 'down' });
     pointerRef.current = {
       active: true,
       hovering: true,
       xNorm: x,
       yNorm: y,
-      prevXNorm: x,
-      prevYNorm: y,
       pointerId: e.pointerId,
     };
   };
@@ -285,21 +318,26 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const [x, y] = toNormCoords(e.clientX, e.clientY);
     const ptr = pointerRef.current;
+    if (ptr.active && ptr.pointerId !== e.pointerId) return;
     ptr.hovering = true;
     ptr.xNorm = x;
     ptr.yNorm = y;
-    if (!ptr.active) {
-      ptr.prevXNorm = x;
-      ptr.prevYNorm = y;
-    }
+    if (ptr.active) pointerPath.current.push({ timeMs: e.timeStamp, x, y, kind: 'move' });
   };
 
   const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (pointerRef.current.pointerId !== e.pointerId) return;
+    pointerRef.current.active = false;
+    pointerRef.current.pointerId = null;
+    if (e.type === 'pointerup') {
+      const [x, y] = toNormCoords(e.clientX, e.clientY);
+      pointerPath.current.push({ timeMs: e.timeStamp, x, y, kind: 'up' });
+    } else {
+      pointerPath.current.clear();
+    }
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
-    pointerRef.current.active = false;
-    pointerRef.current.pointerId = null;
     if (e.pointerType !== 'mouse') {
       pointerRef.current.hovering = false;
     }
@@ -311,156 +349,81 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
     }
   };
 
-  const activeModeOpt = MODE_OPTIONS.find((opt) => opt.id === mode);
+
+  const status = paused ? t.paused : elapsedSec > 0 ? t.running : t.ready;
+  const togglePause = () => {
+    pausedRef.current = !paused;
+    pointerRef.current.active = false;
+    pointerRef.current.pointerId = null;
+    pointerPath.current.clear();
+    setPaused(!paused);
+  };
+  const resetTank = () => {
+    pointerRef.current.active = false;
+    pointerRef.current.pointerId = null;
+    pointerPath.current.clear();
+    resetRequested.current = true;
+  };
 
   return (
-    <div className="flex flex-col gap-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div
-          className="inline-flex flex-wrap items-center gap-1 p-1 bg-[#0F141D] border border-slate-800 rounded-lg"
-          role="tablist"
-          aria-label="Modalità di visualizzazione fluidodinamica"
-        >
-          {MODE_OPTIONS.map((opt) => {
-            const active = mode === opt.id;
-            return (
-              <div key={opt.id} className="inline-flex items-center">
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={active}
-                  onClick={() => onModeChange(opt.id)}
-                  className={`px-3 py-2 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 min-h-[38px] sm:min-h-[34px] ${
-                    active
-                      ? 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/40'
-                      : 'text-slate-400 hover:text-slate-100 border border-transparent'
-                  }`}
-                >
-                  {opt.label}
-                </button>
-                {opt.helpTitle && opt.helpText && (
-                  <span className="pr-1">
-                    <InfoTooltip title={opt.helpTitle} description={opt.helpText} />
-                  </span>
-                )}
-              </div>
-            );
-          })}
+    <section className="lab-stage" aria-labelledby="tank-heading" data-running={!paused && elapsedSec > 0}>
+      <header className="lab-stage-header">
+        <div className="lab-stage-title">
+          <span className="lab-stage-glyph"><Orbit size={21} /></span>
+          <div><h2 id="tank-heading">{t.tank}</h2><p>{t.topView}</p></div>
         </div>
+        <span className="lab-stage-status" data-paused={paused}><i aria-hidden="true" />{status}</span>
+      </header>
 
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={onToggleVectors}
-            aria-pressed={showVectors}
-            className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 min-h-[40px] sm:min-h-[36px] ${
-              showVectors
-                ? 'bg-cyan-500/15 border-cyan-500/40 text-cyan-300'
-                : 'bg-[#0F141D] border-slate-800 text-slate-300 hover:border-slate-700'
-            }`}
-          >
-            <Compass size={14} />
-            Vettori
-          </button>
-
-          <button
-            type="button"
-            onClick={() => {
-              engineRef.current?.reset(configRef.current.viscosityMpas / 1000);
-              onResetComplete?.();
-            }}
-            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg bg-[#0F141D] border border-slate-800 text-slate-200 hover:border-slate-700 transition-colors whitespace-nowrap shrink-0 min-h-[40px] sm:min-h-[36px]"
-          >
-            <RotateCcw size={14} />
-            Reset Vasca
-          </button>
-        </div>
+      <div className="lab-map-toolbar" role="group" aria-label={t.viewSelector}>
+        {MODES.map((option) => <button type="button" key={option} aria-pressed={mode === option}
+          onClick={() => { if (mode !== option) setLockedMode(null); onModeChange(option); }}>{t[option]}</button>)}
+        <button type="button" className="lab-map-vectors" aria-pressed={showVectors} onClick={onToggleVectors}><Compass size={15} />{t.vectors}</button>
       </div>
 
-      <div
-        ref={containerRef}
-        className="relative w-full aspect-square max-w-[600px] mx-auto bg-[#07090E] border border-slate-800 rounded-lg overflow-hidden"
-      >
-        <canvas
-          ref={fluidCanvasRef}
-          onPointerDown={handlePointerDown}
-          onPointerMove={handlePointerMove}
-          onPointerUp={handlePointerUp}
-          onPointerCancel={handlePointerUp}
-          onPointerLeave={handlePointerLeave}
-          className="w-full h-full block touch-none select-none cursor-crosshair"
-        />
-
-        <canvas
-          ref={overlayCanvasRef}
-          className="absolute inset-0 w-full h-full pointer-events-none"
-        />
-
-        <div className="absolute top-3 left-3 pointer-events-none font-mono text-[11px] tabular-nums text-slate-400 bg-[#07090E]/85 border border-slate-800 px-2.5 py-1 rounded">
-          D = {config.tankDiameterMm} mm · d = {config.stirrerDiameterMm} mm
+      <div className="lab-stage-scene">
+        <span className="lab-axis lab-axis-x" aria-hidden="true" />
+        <span className="lab-axis lab-axis-y" aria-hidden="true" />
+        <div className="lab-stage-dimension"><span>{t.diameter}</span><strong>Ø {config.tankDiameterMm} mm</strong></div>
+        <div className="lab-stage-time"><span>{t.simTime}</span><strong>{elapsedSec.toLocaleString(language, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} s</strong></div>
+        <div ref={containerRef} className="lab-tank">
+          <div className="lab-tank-bezel" aria-hidden="true" />
+          <div className="lab-tank-ticks" aria-hidden="true" />
+          <canvas ref={fluidCanvasRef} className="lab-fluid-canvas" aria-label={t.tankLabel}
+            onPointerDown={handlePointerDown} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp}
+            onPointerCancel={handlePointerUp} onLostPointerCapture={handlePointerUp} onPointerLeave={handlePointerLeave} />
+          <canvas ref={overlayCanvasRef} className="lab-overlay-canvas" aria-hidden="true" />
+          {mode === 'fluid' && <div className="lab-tank-glint" aria-hidden="true" />}
         </div>
 
-        {probe && probe.active && (
-          <div className="absolute bottom-3 left-3 right-3 sm:right-auto pointer-events-none bg-[#07090E]/90 border border-slate-800 rounded px-3 py-2 font-mono text-[11px] tabular-nums text-slate-200 grid grid-cols-2 sm:flex sm:items-center gap-x-4 gap-y-1">
-            <span>
-              r: <strong className="text-slate-100">{probe.rMm.toFixed(1)}</strong> mm
-            </span>
-            <span>
-              |u|: <strong className="text-cyan-400">{probe.speedMs.toFixed(2)}</strong> m/s
-            </span>
-            <span>
-              γ̇: <strong className="text-slate-100">{probe.shearRate.toFixed(1)}</strong> s⁻¹
-            </span>
-            <span>
-              τ: <strong className="text-amber-400">{probe.shearStressPa.toFixed(2)}</strong> Pa
-            </span>
-          </div>
-        )}
-
-        {!probe && (
-          <div className="absolute bottom-3 left-3 pointer-events-none font-sans text-xs text-slate-400 bg-[#07090E]/80 border border-slate-800/80 px-2.5 py-1 rounded">
-            Trascina nel recipiente per agitare il fluido
-          </div>
-        )}
+        {probe?.active && <div className="lab-probe" aria-label={t.probe}>
+          <Crosshair size={16} aria-hidden="true" />
+          <span><b>{formatScaleNum(language, probe.speedMs)}</b> m/s</span>
+          <span><b>{formatScaleNum(language, probe.shearRate)}</b> s⁻¹</span>
+          <span><b>{formatScaleNum(language, probe.shearStressPa)}</b> Pa</span>
+        </div>}
       </div>
 
-      {mode === 'fluid' ? (
-        <div className="bg-[#0F141D] border border-slate-800 rounded-lg px-4 py-2.5 flex items-center justify-between gap-2 text-xs">
-          <span className="text-slate-300 font-medium inline-flex items-center gap-2">
-            <span
-              className="inline-block w-2.5 h-2.5 rounded-full border border-white/25 shrink-0"
-              style={{ backgroundColor: config.color }}
-              aria-hidden="true"
-            />
-            Vista Fluido Reale
-          </span>
-          <span className="text-slate-400">
-            Osserva il comportamento fisico di scorrimento, vortici e scia interna
-          </span>
+      {mode !== 'fluid' && <div className="lab-map-legend">
+        <div className="lab-legend-title"><span>{t[mode]} · {scaleRange.unit}</span>
+          <InfoTooltip language={language} title={t[mode]} description={t[MAP_HELP[mode]]} />
         </div>
-      ) : (
-        <div className="bg-[#0F141D] border border-slate-800 rounded-lg px-4 py-2.5 flex flex-col gap-1.5">
-          <div className="flex items-center justify-between text-xs">
-            <span className="text-slate-300 font-medium inline-flex items-center gap-1.5">
-              {scaleRange.label}
-              {activeModeOpt?.helpTitle && activeModeOpt?.helpText && (
-                <InfoTooltip title={activeModeOpt.helpTitle} description={activeModeOpt.helpText} />
-              )}
-            </span>
-            <span className="font-mono text-slate-400 tabular-nums">{scaleRange.unit}</span>
-          </div>
-          <div
-            className="h-2.5 w-full rounded-sm border border-slate-800"
-            style={{ background: getLegendGradient(mode) }}
-          />
-          <div className="flex justify-between font-mono text-[11px] text-slate-400 tabular-nums">
-            <span>{formatScaleNum(scaleRange.min)}</span>
-            <span>{formatScaleNum(scaleRange.mid)}</span>
-            <span>{formatScaleNum(scaleRange.max)}</span>
-          </div>
+        <div className="lab-legend-scale"><div style={{ background: getLegendGradient(mode) }} />
+          <div><span>{formatScaleNum(language, scaleRange.min)}</span><span>{formatScaleNum(language, scaleRange.mid)}</span><span>{formatScaleNum(language, scaleRange.max)}</span></div>
         </div>
-      )}
-    </div>
+        <button type="button" aria-pressed={lockedMode === mode} onClick={() => setLockedMode(lockedMode === mode ? null : mode)}>
+          {lockedMode === mode ? <Lock size={15} /> : <LockOpen size={15} />} {lockedMode === mode ? t.unlockScale : t.lockScale}
+        </button>
+      </div>}
+
+      <footer className="lab-stage-footer">
+        <span className="lab-stage-hint"><MousePointer2 size={17} aria-hidden="true" /> {paused ? t.resumeHint : t.drag}</span>
+        <div className="lab-stage-actions">
+          <button type="button" className="lab-stage-button" aria-label={paused ? t.resume : t.pause} title={paused ? t.resume : t.pause} onClick={togglePause}>{paused ? <Play size={17} /> : <Pause size={17} />}</button>
+          <button type="button" className="lab-stage-button" aria-label={t.reset} title={t.reset} onClick={resetTank}><RotateCcw size={17} /></button>
+        </div>
+      </footer>
+    </section>
   );
 };
 
