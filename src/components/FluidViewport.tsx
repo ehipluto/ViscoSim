@@ -1,11 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Compass, RotateCcw } from 'lucide-react';
-import { getLegendGradient } from '../simulation/colormaps';
-import { FluidViewportRenderer } from '../simulation/webglRenderer';
-import { SimulationController } from '../simulation/workerClient';
+import { CFDEngine } from '../simulation/cfdEngine';
 import {
   FluidConfig,
-  InteractionEvent,
   ProbeSample,
   ScaleRange,
   SimulationMetrics,
@@ -21,8 +18,6 @@ interface FluidViewportProps {
   onToggleVectors: () => void;
   onMetricsUpdate: (metrics: SimulationMetrics) => void;
   onResetComplete?: () => void;
-  controllerRef?: React.MutableRefObject<SimulationController | null>;
-  onEventsSnapshot?: (events: InteractionEvent[]) => void;
 }
 
 const MODE_OPTIONS: Array<{
@@ -37,23 +32,33 @@ const MODE_OPTIONS: Array<{
     label: 'Velocità',
     helpTitle: 'Mappa della Velocità |u|',
     helpText:
-      'Mostra la velocità locale del fluido in m/s su palette percettivamente uniforme (Viridis). Blu scuro = fermo, verde/giallo = flusso rapido.',
+      'Mostra quanto velocemente si muove il fluido in ogni punto (in m/s). Il blu scuro indica zone ferme; ciano, verde e giallo indicano flusso rapido.',
   },
   {
     id: 'vorticity',
     label: 'Vorticità',
     helpTitle: 'Mappa della Vorticità ω',
     helpText:
-      'Mostra la rotazione locale del fluido in s⁻¹ su scala divergente accessibile: blu = oraria, scuro = flusso irrotazionale, ambra = antioraria.',
+      'Evidenzia i vortici e la rotazione locale del fluido (in s⁻¹): blu per rotazione oraria, rosso/ambra per rotazione antioraria, scuro per flusso rettilineo.',
   },
   {
     id: 'shear',
     label: 'Sforzo Taglio',
     helpTitle: 'Mappa dello Sforzo di Taglio τ',
     helpText:
-      'Visualizza lo sforzo di taglio fisico interno τ = μ_app · γ̇ in Pa (palette Inferno). Nei fluidi con soglia τy evidenzia la caverna fluida attorno all’asta.',
+      'Visualizza la forza meccanica interna applicata al fluido (in Pa). Nei fluidi pastosi rivela la "caverna" fluida attorno all’asta rispetto alle zone esterne immobili.',
   },
 ];
+
+function getLegendGradient(mode: VisualizationMode): string {
+  if (mode === 'velocity') {
+    return 'linear-gradient(90deg, #0a0f1c 0%, #0e4e7a 25%, #06b6d4 50%, #34d399 75%, #fde047 100%)';
+  }
+  if (mode === 'vorticity') {
+    return 'linear-gradient(90deg, #38bdf8 0%, #1d4ed8 25%, #111827 50%, #d97706 75%, #f43f5e 100%)';
+  }
+  return 'linear-gradient(90deg, #0b0e17 0%, #581c87 25%, #dc2626 55%, #f59e0b 80%, #fef9c3 100%)';
+}
 
 function formatScaleNum(val: number): string {
   const abs = Math.abs(val);
@@ -72,28 +77,22 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
   onToggleVectors,
   onMetricsUpdate,
   onResetComplete,
-  controllerRef: externalControllerRef,
-  onEventsSnapshot,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const fluidCanvasRef = useRef<HTMLCanvasElement>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
-  const controllerRef = useRef<SimulationController | null>(null);
-  const rendererRef = useRef<FluidViewportRenderer | null>(null);
+  const engineRef = useRef<CFDEngine | null>(null);
   const sizeRef = useRef<number>(512);
-  const prevQualityRef = useRef(config.quality);
 
   const configRef = useRef(config);
   const modeRef = useRef(mode);
   const vectorsRef = useRef(showVectors);
   const metricsCallbackRef = useRef(onMetricsUpdate);
-  const eventsCallbackRef = useRef(onEventsSnapshot);
 
   configRef.current = config;
   modeRef.current = mode;
   vectorsRef.current = showVectors;
   metricsCallbackRef.current = onMetricsUpdate;
-  eventsCallbackRef.current = onEventsSnapshot;
 
   const pointerRef = useRef<{
     active: boolean;
@@ -123,34 +122,17 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
   });
 
   useEffect(() => {
-    if (prevQualityRef.current !== config.quality) {
-      prevQualityRef.current = config.quality;
-      controllerRef.current?.setQuality(config.quality, config);
-    }
-  }, [config]);
-
-  useEffect(() => {
     const fluidCanvas = fluidCanvasRef.current;
     const overlayCanvas = overlayCanvasRef.current;
     const container = containerRef.current;
     if (!fluidCanvas || !overlayCanvas || !container) return;
 
-    const renderer = new FluidViewportRenderer();
-    renderer.init(fluidCanvas, 96);
-    rendererRef.current = renderer;
-
-    const controller = new SimulationController(configRef.current);
-    controllerRef.current = controller;
-    if (externalControllerRef) {
-      externalControllerRef.current = controller;
-    }
+    const engine = new CFDEngine();
+    engine.initRenderer(fluidCanvas);
+    engineRef.current = engine;
 
     const overlayCtx = overlayCanvas.getContext('2d');
-    if (!overlayCtx) {
-      controller.dispose();
-      renderer.dispose();
-      return;
-    }
+    if (!overlayCtx) return;
 
     const syncCanvasSize = () => {
       const rect = container.getBoundingClientRect();
@@ -174,66 +156,44 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
     const renderFrame = (now: number) => {
       const dt = Math.min(0.033, Math.max(0.004, (now - lastFrameTime) * 0.001));
       lastFrameTime = now;
-      controller.recordRenderTick();
 
       const cfg = configRef.current;
       const ptr = pointerRef.current;
-      const stir = ptr.active
-        ? {
-            x0: ptr.prevXNorm,
-            y0: ptr.prevYNorm,
-            x1: ptr.xNorm,
-            y1: ptr.yNorm,
-            dt,
-          }
-        : null;
       if (ptr.active) {
+        engine.applyStirrerImpulse(
+          ptr.prevXNorm,
+          ptr.prevYNorm,
+          ptr.xNorm,
+          ptr.yNorm,
+          dt,
+          cfg
+        );
         ptr.prevXNorm = ptr.xNorm;
         ptr.prevYNorm = ptr.yNorm;
       }
 
-      controller.requestStep({
-        dt,
-        config: cfg,
-        mode: modeRef.current,
-        includeVectors: vectorsRef.current,
-        stir,
-        probe: ptr.hovering || ptr.active ? { xNorm: ptr.xNorm, yNorm: ptr.yNorm } : null,
-      });
+      engine.step(dt, cfg);
 
       const sz = sizeRef.current;
-      const snapshot = controller.consumeLatestSnapshot();
-      if (snapshot) {
-        renderer.renderFluidField(
-          fluidCanvas,
-          snapshot.fieldBytes,
-          snapshot.gridN,
-          sz,
-          sz,
-          modeRef.current,
-          cfg.color
-        );
-      }
+      const range = engine.renderFluidLayer(
+        fluidCanvas,
+        sz,
+        sz,
+        modeRef.current,
+        cfg.color
+      );
 
       overlayCtx.clearRect(0, 0, sz, sz);
       const cx = sz * 0.5;
       const cy = sz * 0.5;
       const radiusPx = sz * 0.45;
 
-      if (vectorsRef.current && snapshot && snapshot.vectors) {
+      if (vectorsRef.current) {
         overlayCtx.save();
         overlayCtx.beginPath();
         overlayCtx.arc(cx, cy, radiusPx, 0, Math.PI * 2);
         overlayCtx.clip();
-        renderer.drawVectorOverlay(
-          overlayCtx,
-          snapshot.vectors,
-          snapshot.vectorCount,
-          snapshot.gridN,
-          sz,
-          sz,
-          snapshot.scaleRange
-        );
+        engine.drawVectorOverlay(overlayCtx, sz, sz);
         overlayCtx.restore();
       }
 
@@ -275,13 +235,12 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
         }
       }
 
-      if (snapshot && now - lastUiSyncTime >= 100) {
+      if (now - lastUiSyncTime >= 100) {
         lastUiSyncTime = now;
-        setScaleRange(snapshot.scaleRange);
-        metricsCallbackRef.current(snapshot.metrics);
-        eventsCallbackRef.current?.(controller.getInteractionEvents());
+        setScaleRange(range);
+        metricsCallbackRef.current(engine.getMetrics(cfg, range));
         if (ptr.hovering || ptr.active) {
-          setProbe(snapshot.probe);
+          setProbe(engine.sampleProbe(ptr.xNorm, ptr.yNorm, cfg));
         } else {
           setProbe(null);
         }
@@ -295,15 +254,10 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
     return () => {
       cancelAnimationFrame(rafId);
       observer.disconnect();
-      controller.dispose();
-      renderer.dispose();
-      controllerRef.current = null;
-      rendererRef.current = null;
-      if (externalControllerRef) {
-        externalControllerRef.current = null;
-      }
+      engine.dispose();
+      engineRef.current = null;
     };
-  }, [externalControllerRef]);
+  }, []);
 
   const toNormCoords = (clientX: number, clientY: number): [number, number] => {
     const canvas = fluidCanvasRef.current;
@@ -412,7 +366,7 @@ const FluidViewport: React.FC<FluidViewportProps> = ({
           <button
             type="button"
             onClick={() => {
-              controllerRef.current?.reset(configRef.current);
+              engineRef.current?.reset(configRef.current.viscosityMpas / 1000);
               onResetComplete?.();
             }}
             className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg bg-[#0F141D] border border-slate-800 text-slate-200 hover:border-slate-700 transition-colors whitespace-nowrap shrink-0 min-h-[40px] sm:min-h-[36px]"

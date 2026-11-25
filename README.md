@@ -1,37 +1,38 @@
-# ViscoSim — CFD Viscosity & Rheology Simulator
+# ViscoSim — Simulatore CFD di Viscosità e Reologia
 
-High-performance client-side web application for 2D computational fluid dynamics (CFD) simulation in a stirred cylindrical vessel and rheological analysis of industrial fluids across the range `0 – 500,000 mPa·s`.
+Applicazione web client-side per la simulazione fluidodinamica 2D in vasca cilindrica agitata e l'analisi reologica di fluidi industriali nell'intervallo `0 – 500.000 mPa·s`.
 
-## Numerical Solver & Rendering Architecture
+## Modello Numerico e Rendering
 
-- **Fluid Solver**: `96×96` staggered MAC grid with exact circular no-slip boundary conditions and sub-cell edge distance weighting.
-- **Viscous & Pressure Integrator**: 5-level *Galerkin Multigrid* + *PCG* solver for implicit viscous diffusion and 2-pass *Rotational Incremental Pressure-Correction* for robust stability in Creeping/Stokes flows and low-Reynolds regimes.
-- **Rheology Engine**: Newtonian, *Power-Law*, and regularized *Herschel-Bulkley* (Papanastasiou) models calculating real-time shear rate $\dot{\gamma}$, shear stress $\tau$, vorticity $\omega$, Reynolds number $Re$, and Danckwerts mixing index $M(t)$.
-- **Visualization Pipeline**: *WebGL1* renderer with Catmull-Rom bicubic filtering on normalized float textures, vector field overlays, local interactive probes, and automatic *Canvas 2D* fallback.
+- **Solutore fluido**: griglia sfalsata MAC `96×96` con condizioni al contorno *no-slip* sulla parete circolare e distanze sub-cella esatte per i gradienti di bordo.
+- **Integratore viscoso & pressione**: *Galerkin Multigrid* (`5` livelli) + *PCG* per la diffusione viscosa implicita e schema *Rotational Incremental Pressure-Correction* a 2 passaggi per stabilità in regime *Stokes/Creeping* e basso Reynolds.
+- **Reologia**: modelli Newtoniano, *Power-Law* e *Herschel-Bulkley* regolarizzato (Papanastasiou) con calcolo in tempo reale di taglio $\dot{\gamma}$, sforzo $\tau$, vorticità $\omega$, numero di Reynolds $Re$ ed indice di omogeneità di Danckwerts $M(t)$.
+- **Visualizzazione**: pipeline *WebGL1* con filtraggio bicubico *Catmull-Rom* su texture floating-normalized e fallback automatico su *Canvas 2D*.
 
-## Project Structure
+## Struttura del Progetto
 
 ```text
 src/
 ├── components/
-│   ├── FluidViewport.tsx   # Interactive WebGL viewport + vector overlay & local probe
-│   ├── InfoTooltip.tsx     # Accessible contextual tooltips
-│   ├── MixingChart.tsx     # Danckwerts mixing index M(t) & kinetic energy Ek history
-│   └── RheologyChart.tsx   # Log-log flow curve τ(γ̇) & μ(γ̇) with live operating point
+│   ├── FluidViewport.tsx   # Viewport interattivo WebGL + overlay vettori e sonda locale
+│   ├── InfoTooltip.tsx     # Tooltip contestuali accessibili
+│   ├── MixingChart.tsx     # Serie storica omogeneità M(t) ed energia cinetica Ek
+│   └── RheologyChart.tsx   # Curva di flusso log-log τ(γ̇) e μ(γ̇)
 ├── constants/
-│   └── fluids.ts           # Calibrated industrial presets and rheological formulas
+│   └── fluids.ts           # Preset industriali calibrati e funzioni reologiche
 ├── simulation/
-│   └── cfdEngine.ts        # Galerkin MG-PCG CFD engine & WebGL/2D renderer
+│   └── cfdEngine.ts        # Motore CFD Galerkin MG-PCG e renderer WebGL/2D
 ├── types/
-│   └── rheology.ts         # TypeScript interfaces for configuration, probes, and metrics
-└── App.tsx                 # Control dashboard, real-time telemetry & CSV export
+│   └── rheology.ts         # Contratti TypeScript per configurazione, sonda e metriche
+└── App.tsx                 # Interfaccia di controllo, telemetria ed esportazione CSV
 ```
 
-## Development & Build
+## Sviluppo e Build
 
 ```bash
 npm install
-npm run dev      # Start Vite development server on http://localhost:3000
-npm run lint     # Run strict TypeScript type check
-npm run build    # Generate production static bundle in dist/
+npm run dev      # Avvia il server di sviluppo su http://localhost:3000
+npm run lint     # Verifica tipi TypeScript in modalità strict
+npm run build    # Genera il bundle statico di produzione in dist/
 ```
+
